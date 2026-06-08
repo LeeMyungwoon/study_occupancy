@@ -5,8 +5,11 @@
 - 가상환경 세팅
    - python3 -m venv ~/venv/study_occupancy
    - pip install --upgrade pip
-   - python3 -m venv ~/venv/study_occupancy
    - python -m pip install --upgrade pip setuptools wheel
    - pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
    - pip install numpy scipy matplotlib opencv-python pillow pyyaml tqdm einops pytest ipython tensorboard
-
+   - pip install tqdm
+- 검증
+   - find phases final_occnet_v1 -maxdepth 3 -type d | sort 실행 완료
+   - .gitkeep 추가 완료
+   - ~/venv/study_occupancy/bin/python import 확인: venv imports ok
