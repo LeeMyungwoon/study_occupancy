@@ -13,3 +13,11 @@
    - find phases final_occnet_v1 -maxdepth 3 -type d | sort 실행 완료
    - .gitkeep 추가 완료
    - ~/venv/study_occupancy/bin/python import 확인: venv imports ok
+
+# d002
+- tensor_utils.py 생성
+- flatten_hw / unflatten_hw 구현
+- flatten_xyz / unflatten_xyz 구현
+- B x C x H x W <-> B x HW x C 변환 테스트
+- B x C x X x Y x Z <-> B x XYZ x C 변환 테스트
+- pytest 실행 결과: 2 passed
