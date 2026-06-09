@@ -44,3 +44,18 @@
    - backbone은 원본 이미지를 압축해서 attention token 수를 줄인다
    - out_channels는 각 위치의 feature 개수를 바꾼다
    - 기본적인 PyTorch nn사용법, class 구조 익힘
+
+# d005
+- Conv3DBlock 구현
+- voxel_blocks.py 생성
+- test_voxel_blocks.py 생성
+- input: B x 16 x 8 x 4 x 2
+- output: B x 32 x 8 x 4 x 2
+- Conv3d + BatchNorm3d + ReLU 구조 사용
+- BatchNorm3d  파라미터에는 이전 채널 수 <- 배치안에 있는 채널들마다 평균과 분산을 구하기 때문, ex) 5개의 배치 데이터안에 있는 3개의 피쳐(채널)
+- optimizer = torch.optim.Adam(model.parameters(), lr = 1e-3) <- 옵티마이저 선택하고
+- optimizer.zero_grad() <- 기울기(그라디언트) 0으로 세팅하고 (멀티헤드 등을 위해 Pytorch 에서는 그냥 loss.backward() 하면 기울기 누적된다)
+- loss = output.mean() <- 로스 구하고
+- loss.backward() <- 미분값 계산하고
+- optimizer.step() <- 가중치 수정하고
+- pytest 실행 결과: 1 passed
