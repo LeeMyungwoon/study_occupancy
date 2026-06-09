@@ -29,3 +29,18 @@
    - permute는 값을 복사하지 않고 축 순서와 stride를 바꿔 tensor를 다르게 보게 한다 -> 실제 메모리 구조를 변경하는것이 아니다.(약간 관점만 바꾼 느낌), non-contiguous 상태가 된다
    - view는 tensor가 contiguous한 memory layout일 때만 안전하게 shape를 바꿀 수 있다
    - reshape는 view보다 유연하고, non-contiguous tensor에서는 필요하면 내부적으로 copy해서 shape를 바꿀 수 있다.
+
+# d004
+- TinyImageBackbone 구현
+- image_backbone.py 생성
+- test_image_backbone.py 생성
+- input: B x 3 x 128 x 256
+- output: B x 32 x 16 x 32
+- Conv2d stride=2를 3번 사용해서 spatial 크기를 128 x 256 -> 16 x 32 로 줄임
+- channel은 3 -> 16 -> 32 -> 32 로 변경됨
+- pytest 실행 결과: 1 passed
+- 이해한 점:
+   - stride=2는 H, W를 줄인다
+   - backbone은 원본 이미지를 압축해서 attention token 수를 줄인다
+   - out_channels는 각 위치의 feature 개수를 바꾼다
+   - 기본적인 PyTorch nn사용법, class 구조 익힘
