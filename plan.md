@@ -43,6 +43,20 @@ multi-camera image
   one-batch overfit
 ```
 
+참고:
+
+```text
+architecture 문서의 refinement 최종 형태는
+budget-K Gaussian refinement branch (GaussianFormer 계열)다.
+
+이 plan의 Phase 08은 같은 인터페이스
+(selected voxel -> local context -> 임의 점 평가)를 가진
+packed Queryable MLP baseline을 만든다.
+
+Gaussian 교체는 6개월 커리큘럼에 넣지 않고
+D130의 다음 3개월 트랙에서 ablation으로 진행한다.
+```
+
 ---
 
 ## 1. Phase 디렉토리 구조
@@ -1479,6 +1493,19 @@ class RealDatasetStub(Dataset):
     # 실제 dataset 연결 전 interface만 정의
 ```
 
+설계 주의:
+
+```text
+interface는 architecture 문서 Section 19의 GT 출력을
+받을 수 있는 키 구조로 정의한다.
+
+images / intrinsics / pose
+occupancy (occupied / free / unknown)
+z_surface / surface_valid
+dynamic mask / flow
+continuous SDF samples (optional, refinement 학습용)
+```
+
 ### D064: single-frame overfit 안정화
 
 할 일:
@@ -1487,6 +1514,8 @@ class RealDatasetStub(Dataset):
 learning rate 조정
 channel 수 조정
 loss가 내려가지 않으면 architecture를 단순화
+그래도 불안정하면 auxiliary depth supervision 추가
+(architecture 문서 Section 4, synthetic은 depth GT가 공짜)
 ```
 
 ### D065: Phase 05 report
@@ -1830,6 +1859,15 @@ class BEVMemoryQueue:
 
 ```text
 N_history=3 유지
+```
+
+설계 주의:
+
+```text
+architecture 문서 기준 memory는 0.8m BEV로 저장/warp하고,
+keyframe은 ~0.2s 시간 간격으로 띄엄띄엄 저장한다.
+toy 단계에서는 grid가 작으므로 동일 해상도로 시작해도 되지만,
+queue 인터페이스에 (저장 해상도, keyframe 간격) 설정을 열어둔다.
 ```
 
 ### D085: temporal fusion simple
@@ -2208,6 +2246,15 @@ class FineOverlay:
     # local cuboids / local boundary samples
 ```
 
+설계 주의:
+
+```text
+FineOverlay는 "selected voxel -> 파라미터 집합 -> 임의 점 평가"
+인터페이스로 추상화한다.
+이후 architecture 문서의 budget-K Gaussian refinement branch로
+구현체만 교체할 수 있게 한다.
+```
+
 ### D109: refinement toy training
 
 만들 파일:
@@ -2554,9 +2601,23 @@ phases/phase_10_runtime_final_report/reports/next_3_months.md
 
 ```text
 TensorRT FP16
-P3-only local image re-query v1.5
+budget-K Gaussian refinement branch 교체 실험
+  - GaussianFormer-2-style probabilistic superposition 평가
+  - deformable image re-query (P3, 1 round)
+  - Phase 08 packed Queryable MLP refinement와 ablation 비교
 flow-aware dynamic feature correction
-real dataset label pipeline
+camera-only GT auto-labeling pipeline (architecture 문서 Section 19)
+  - Stage A: MapAnything / MASt3R 기반 metric 재구성
+    (vanilla DUSt3R 직접 사용 금지: scale 모호 / pair 단위 추론 /
+     정적 가정 / 기지 calibration 미활용)
+  - SAM2 + tracking 동적 분리, ray casting free/unknown
+  - Stage B: 3DGS refinement -> 연속 SDF (sub-voxel supervision)
+  - 검증: nuScenes에서 Occ3D LiDAR GT와 거리별 오차 정량 비교 후
+    자체 데이터 적용
+Basalt VIO 연동 (architecture 문서 Section 20)
+  - v1: pose / 중력 정렬, landmark sparse depth supervision
+  - v1.5: landmark 입력 주입 + dropout, outlier dynamic 힌트,
+    landmark ray free-space 증거
 ```
 
 ---
