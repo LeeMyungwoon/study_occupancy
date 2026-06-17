@@ -1,23 +1,61 @@
 # Tesla-style Queryable Occupancy Network Architecture
 
-이 문서는 Tesla Occupancy Network 공개 발표에서 보이는 방향성을 참고하되, 실제 구현을 위해 REO, ViewFormer, PanoOcc, SparseOcc, GaussianFormer 계열 아이디어를 섞은 아키텍처 초안이다.
+이 문서는 Tesla AI Day 2022의 Occupancy Network 공개 구조를 참고하되, 실제 구현을 위해 REO, ViewFormer, PanoOcc, BEVFormer/BEVDet4D 계열 아이디어를 섞은 아키텍처 초안이다.
 
-이 구조는 여러 논문/레포의 장점을 다음처럼 가져온 하이브리드 설계다.
+현재 설계의 핵심은 다음이다.
+
+```text
+최종 해상도:
+  30cm voxel (occupied 표면)
+
+최종 feature (2-해상도 hybrid):
+  free/unknown 빈 공간: coarse dense @ 0.6m
+  occupied 표면:        sparse deconv + 프루닝으로 30cm까지
+  (30cm dense volume feature는 만들지 않는다)
+
+최종 출력:
+  Tesla-style 4개 Volume Head를 붙인다.
+
+4 Volume Heads:
+  1. Occupancy Head
+  2. Occupancy Flow Head
+  3. Sub-Voxel Shape Information Head
+  4. 3D Semantics Head
+```
+
+이 문서에서 "refine"이라고 부르던 기능은 별도 예측 경로가 아니라, **Sub-Voxel Shape Information Head** 안으로 들어간다. 즉 30cm voxel 자체의 occupied/free/unknown 여부는 Occupancy Head가 만들고, 30cm voxel 내부에서 실제 표면이 어디를 지나가는지, 어떤 face가 노출되어 있는지, normal과 offset이 무엇인지는 Sub-Voxel Shape Information Head가 만든다.
+
+여러 논문/레포에서 가져오는 핵심 아이디어는 다음과 같다.
 
 | Source | 가져오는 핵심 아이디어 | 이 문서에서 쓰는 위치 |
 |---|---|---|
-| REO | calibration-free / calibration-light vanilla cross-attention, query-based fine prediction | canonical-view spatial lifting |
-| ViewFormer | streaming temporal BEV memory, ego-motion alignment, temporal attention | 1.6m 3D feature 직후 temporal module |
-| PanoOcc | coarse-to-fine 3D deconvolution, unified occupancy representation | 1.6m -> 0.8m -> 0.4m dense decoder |
-| SparseOcc / sparse conv 계열 | 중요한 영역만 sparse하게 refine | active mask / quota Top-K 기반 refinement 영역 선택 |
-| GaussianFormer / GaussianFormer-2 | object-centric 3D Gaussian, deformable image re-query, probabilistic Gaussian superposition | budget-K Gaussian refinement branch, probabilistic queryable evaluation |
-| RoadBEV / FastRSR | BEV에서 road surface elevation을 직접 예측 | road surface geometry head |
+| REO | calibration-free / calibration-light **vanilla attention 방식** (projection-first deformable attention 대신) | 1.2m spatial lifting의 attention 종류. 단 REO는 이 attention을 BEV query에 적용하지만, 본 문서는 Tesla처럼 3D voxel query에 적용한다 |
+| ViewFormer | z-squeeze voxel->BEV temporal, streaming memory(N=4), ego-motion alignment, BEV-level occupancy flow | 0.6m 단일 BEV temporal+flow stage (ViewFormer voxel query ~0.8m에 근접) |
+| BEVFormer / BEVDet4D | BEV feature ego-motion alignment, temporal fusion 위치에 대한 교훈 | pre-temporal refinement, coarse temporal fusion |
+| PanoOcc | coarse-to-fine **sparse deconvolution + occupancy 프루닝**, unified occupancy representation | 1.2m -> 0.6m -> 0.3m sparse decoder (단계마다 점유 후보만 keep) |
+| SparseOcc / sparse execution 계열 | 중요한 위치만 더 비싼 연산을 실행하는 runtime control | sparse decoder의 프루닝 + Sub-Voxel Shape Head의 masked / face-aware execution |
+| RoadBEV / FastRSR | BEV에서 road surface elevation을 직접 예측하는 관점 | 4개 volume head에서 surface geometry를 readout하는 방식 |
 
-특히 spatial lifting은 **vanilla cross-attention**을 기본으로 한다. 즉 projection-first deformable attention을 기본 구조로 두지 않고, 1.6m 3D voxel query가 multi-camera image tokens를 `Q/K/V` attention으로 읽는 방식이다.
+특히 spatial lifting은 **vanilla cross-attention**을 기본으로 한다. projection-first deformable attention을 기본 구조로 두지 않고, 1.2m 3D voxel query가 multi-camera image tokens를 `Q/K/V` attention으로 읽는 방식이다.
 
-예외는 budget-K Gaussian refinement branch 하나다. 이 branch는 선택된 소수의 refinement Gaussian이 자기 위치를 canonical virtual camera에 재투영해 image feature를 다시 읽는 deformable re-query를 사용한다. projection 대상이 하드웨어와 무관한 virtual camera(설계 상수)이므로, raw calibration에 의존하지 않는다는 calibration-light 원칙은 유지된다.
+여기서 두 논문의 역할을 정확히 구분한다.
+
+```text
+attention 종류 (from REO):
+  projection-first deformable attention이 아니라
+  calibration-light vanilla cross-attention을 쓴다.
+  REO는 이 vanilla attention을 BEV query에 적용한다.
+
+query 타깃 (from Tesla):
+  REO와 달리, BEV가 아니라 3D voxel query에 직접 적용한다.
+  Tesla AI Day 그림의 Spatial Query가 3D latent를 만드는 방식을 따른다.
+```
+
+즉 이 spatial lifting은 "REO의 vanilla attention 방식 + Tesla의 3D voxel query 타깃"의 의도된 hybrid다. 3D voxel query(50 x 17 x 5 = 4,250개)는 BEV query(850개)보다 약 5배 비싸지만, 그 대가로 lifting 단계에서 **높이(Z) 정보를 직접 보존**한다. 이는 속도 대비 정확도를 위한 의식적 선택이다.
 
 Reference visual style: [Screenshot from 2026-06-05 22-38-02.png](<Screenshot from 2026-06-05 22-38-02.png>)
+
+---
 
 ## 0. Target Space and Whole Architecture
 
@@ -28,42 +66,88 @@ X range:
   rear 10m ~ front 50m
   total 60m
 
-Y range:
+Y target range:
   left 10m ~ right 10m
   total 20m
 
-Z range:
-  -1m ~ +4m
-  total 5m
+Z target range:
+  -2m ~ +4m
+  total 6m
   (z축은 차체가 아니라 중력에 정렬, Section 20)
+  (격자=타깃: 6m = 20 cells로 딱 떨어지므로 Z는 padding/mask가 없다)
 
 Final voxel size:
-  0.2m x 0.2m x 0.2m
-
-Final dense occupancy output:
-  300 x 100 x 25
-  = 750,000 voxels
+  0.3m x 0.3m x 0.3m
 ```
 
-가장 중요한 설계 구분:
+Z 범위 근거 (약 2m 높이 로봇 기준):
 
 ```text
-20cm dense occupancy output:
-  만든다.
+위 +4m:
+  로봇 키(~2m) + 윗마진 ~2m -> 낮은 천장 / 육교 / 돌출물 통과 판단에 충분.
+  그 이상(>4m)은 2m 로봇 충돌/통과와 무관하므로 두지 않는다.
 
-20cm full dense feature volume:
-  만들지 않는다.
-
-Budget-K refinement Gaussians:
-  active mask가 고른 중요한 voxel에서만 초기화한다.
-  deformable image re-query로 파라미터를 refine하고,
-  probabilistic queryable evaluation의 연속 local 표현으로 사용한다.
-
-Road surface outputs:
-  20cm BEV grid에서 Road Surface Geometry Head로 만든다.
-  volume occupancy의 바닥 slice로 대체하지 않는다.
-  v1 core에서는 z_surface / valid / uncertainty에 집중한다.
+아래 -2m:
+  내리막 / 경사로 하행 / 연석 아래 / 구멍(negative obstacle) /
+  pitch 시 원거리 바닥을 담기 위해 아래쪽을 1m 더 확보.
 ```
+
+30cm는 60m X축과 6m Z축에는 딱 떨어지지만, 20m Y축에는 딱 나누어떨어지지 않는다(20.4m로 padding). 따라서 모델 내부 tensor는 Y만 padding된 aligned grid를 쓰고, Y의 valid ROI는 mask로 crop한다. X·Z는 격자=타깃이라 mask가 필요 없다.
+
+```text
+Internal 30cm grid:
+  X: 200 cells = 60.0m   (격자=타깃)
+  Y:  68 cells = 20.4m   (타깃 20m, 0.4m padding)
+  Z:  20 cells =  6.0m   (격자=타깃, -2m ~ +4m)
+
+0.3m 표현:
+  이 200 x 68 x 20 grid 위에서 sparse하게 유지한다.
+  dense하게 채우지 않고, sparse deconv + 프루닝으로
+  occupied/boundary 후보 voxel만 활성화한다.
+
+Target valid ROI:
+  X: rear 10m ~ front 50m  (전체)
+  Y: left/right 10m 영역   (68칸 중 20m만 valid)
+  Z: -2m ~ +4m 영역        (전체)
+```
+
+가장 중요한 설계 구분 (2-해상도 hybrid):
+
+```text
+Coarse dense occupancy / visibility:
+  0.6m에서 dense하게 만든다 (temporal stage와 같은 해상도).
+  occupied / free / unknown / visibility를 담당한다.
+  빈 공간은 크고 매끄러우므로 30cm 정밀도가 필요 없다.
+
+Sparse fine 30cm output:
+  PanoOcc식 sparse deconv + occupancy 프루닝으로
+  occupied / boundary surface voxel만 남긴다.
+  표면 정밀 Occupancy / Flow / Sub-Voxel Shape / Semantics는
+  이 살아남은 sparse voxel 위에서 계산한다.
+
+별도 30cm dense 3D feature volume:
+  만들지 않는다. 프루닝으로 sparse하게 유지한다.
+
+Sub-Voxel Shape Information:
+  4개 volume head 중 하나로 예측한다.
+  sparse 표면 voxel 중에서도 비싼 local query는
+  exposed face가 있는 voxel에만 masked 실행한다.
+```
+
+핵심 원리:
+
+```text
+free / unknown (빈 공간의 속성):
+  저주파, 큰 덩어리 -> coarse dense로 충분
+
+occupied surface (물체 경계 / 형상):
+  고주파, 정밀 필요 -> sparse fine 30cm
+
+-> dense 0.3m volume 비용을 피하면서
+   Tesla 4 volume head를 모두 유지한다.
+```
+
+이 분리의 근거는 Tesla 데모 영상이다. Tesla occupancy 데모의 voxel은 빈 공간이 아니라 **표면에만** 존재한다. 즉 최종 표현 자체가 surface-centric(사실상 sparse)이며, free space는 planner용으로 별도/coarse하게 들고 있는 것으로 보인다. 본 문서의 2-해상도 hybrid는 이 관찰을 그대로 따른 것이다.
 
 Tesla 발표 그림과 비슷한 블록 흐름으로 보면 다음과 같다.
 
@@ -90,113 +174,100 @@ Tesla 발표 그림과 비슷한 블록 흐름으로 보면 다음과 같다.
             |
             v
 +-------------------------------+
-| Spatial Attention at 1.6m     |
-| REO-style vanilla attention   |
-| Q: 1.6m 3D voxel queries      |
+| Spatial Attention at 1.2m     |
+| REO vanilla attention 방식    |
+| Q: 1.2m 3D voxel queries(Tesla)|
 | K,V: image tokens             |
 +---------------+---------------+
                 |
                 v
 +-------------------------------+
-| 1.6m Coarse 3D Feature        |
-| 38 x 13 x 4 x C               |
+| 1.2m Spatial Feature          |
+| 50 x 17 x 5 x C               |
++---------------+---------------+
+                |
+                v
++-------------------------------+
+| Dense Deconv 1.2m -> 0.6m     |
+| F_0.6 dense 100 x 34 x 10     |
++---------------+---------------+
+                |
+                v
++-------------------------------+
+| 0.6m Refinement (pre-temporal)|
+| BEVDet4D 교훈: temporal 전 인코딩|
 +---------------+---------------+
                 |
                 v
 +-------------------------------+       +--------------------------+
-| ViewFormer-style Temporal     |<----->| Streaming BEV Memory     |
-| z-squeeze to BEV              |       | ego-motion aligned       |
-| temporal attention            |       | N history frames         |
-| inject back to 3D feature     |       +--------------------------+
+| ViewFormer-style Temporal@0.6m|<----->| Streaming BEV Memory     |
+| z-squeeze -> B_0.6            |       | ego-motion aligned       |
+| 경량 gated conv (NOT full attn)|       | N=3~4 history keyframes  |
+| BEV-level flow                |       +--------------------------+
+| unsqueeze -> inject to F_0.6  |
 +---------------+---------------+
                 |
                 v
-+-------------------------------+
-| Dense Deconvolutions          |
-| 1.6m -> 0.8m                  |
-| 0.8m -> 0.4m                  |
-+---------------+---------------+
-                |
-                v
-+-------------------------------+
-| 0.4m Dense 3D Feature         |
-| valid: 150 x 50 x 13 x C      |
-+-------+-----------+-----------+
-        |           |
-        |           +------------------------------+
-        |                                          |
-        v                                          v
-+-----------------------+              +--------------------------+
-| Surface Outputs       |              | Structured Sub-voxel Head|
-| road surface geometry |              | 1x1x1 conv on 0.4m feat  |
-| z_surface / valid     |              | 2x2x2 logits per cell    |
-| uncertainty           |              | reshape / crop           |
-| derived slope / step  |              |                          |
-+-----------------------+              +------------+-------------+
-                                                    |
-                                                    v
-                                       +--------------------------+
-                                       | Volume Outputs           |
-                                       | 300 x 100 x 25           |
-                                       | occupancy / free         |
-                                       | unknown                  |
-                                       | dynamic / flow           |
-                                       +------------+-------------+
-                                                    |
-                                                    v
-                                       +--------------------------+
-                                       | Active Mask Selection    |
-                                       | surface / boundary       |
-                                       | uncertainty / dynamic    |
-                                       | planner path / visibility|
-                                       +------------+-------------+
-                                                    |
-                                                    v
-                                       +--------------------------+
-                                       | Budget-K Gaussian Refine |
-                                       | init from selected voxels|
-                                       | deformable image re-query|
-                                       | 1~2 rounds / K hard cap  |
-                                       +------------+-------------+
-                                                    |
-                                                    v
-                                       +--------------------------+
-                                       | Queryable Outputs        |
-                                       | x,y,z -> probabilistic   |
-                                       |   Gaussian superposition |
-                                       | continuous occupancy     |
-                                       | adaptive surface overlay |
-                                       +--------------------------+
++-------------------------------+       +--------------------------+
+| Coarse Dense Occupancy @0.6m  |       | Sparse Deconv + Prune    |
+| occupied/free/unknown/vis     |       | 0.6m -> 0.3m             |
+| (빈 공간 free/unknown 담당)   |       | keep occupied 후보만     |
+| (프루닝 guide도 담당)         |       +------------+-------------+
++---------------+---------------+                    |
+                |                                    v
+                |                       +--------------------------+
+                |                       | Sparse 0.3m Surface Feat |
+                |                       | kept voxels only         |
+                |                       +------------+-------------+
+                |                                    |
+                v                                    v
++--------------------------------------------------------------+
+| Tesla-style 4 Volume Heads (= Tesla "Volume Outputs")        |
+| 1. Occupancy Head (coarse dense free/unknown +               |
+|                    sparse fine occupied surface)             |
+| 2. Occupancy Flow Head        (0.3m sparse 출력,             |
+|                                motion은 0.6m temporal에서)   |
+| 3. Sub-Voxel Shape Info Head  (sparse + exposed-face masked) |
+| 4. 3D Semantics Head          (sparse, kept voxels)          |
++------+----------------------------------------+--------------+
+       |                                        |
+       v                                        v
++---------------------------+        +-------------------------------+
+| Surface Outputs (별도 head)|       | Queryable Output Interface    |
+| = Tesla "Surface Outputs" |        | pruned 영역 -> free/unknown 즉답|
+| dense BEV: z_surface,     |        | occupied 근처 -> sparse feat  |
+| slope, step, uncertainty  |        | + shape code + local coord    |
++---------------------------+        +-------------------------------+
 ```
 
 축약하면:
 
 ```text
-Canonical-view REO-style spatial attention
-+ ViewFormer-style temporal BEV memory
-+ PanoOcc-style 2-stage deconv to 0.4m
-+ RoadBEV/FastRSR-style road surface geometry
-+ flow occupancy output
-+ structured sub-voxel 20cm dense occupancy head
-+ dynamic-resolution refinement
-+ GaussianFormer-style budget-K refinement Gaussians
-+ GaussianFormer-2-style probabilistic queryable evaluation
+Canonical-view vanilla attention (REO 방식) on 3D voxel query (Tesla 타깃)
++ dense deconv 1.2m -> 0.6m
++ 0.6m pre-temporal refinement (BEVDet4D 교훈)
++ ViewFormer-style single BEV temporal @ 0.6m (경량 conv, BEV flow)
++ coarse dense occupancy/visibility @ 0.6m (free/unknown 담당)
++ PanoOcc-style sparse deconv + 프루닝 0.6m -> 0.3m
++ Tesla-style 4 Volume Heads (sparse 표면 voxel 위)
++ Surface Outputs head (Tesla처럼 별도 브랜치)
++ face-aware Sub-Voxel Shape Information
++ queryable occupancy interface
 ```
 
 핵심 목표는 다음과 같다.
 
-- 최종 출력은 20cm 정사각 voxel 기반 dense occupancy grid로 만든다.
-- 하지만 20cm 해상도의 dense feature volume은 만들지 않는다.
-- spatial attention은 coarse grid에서 수행해 비용을 낮춘다.
-- temporal context는 ViewFormer처럼 BEV memory에서 streaming으로 처리한다.
-- PanoOcc처럼 coarse-to-fine deconvolution을 사용하되, 0.4m feature까지만 dense하게 키운다.
-- 0.2m final occupancy는 structured sub-voxel channel head로 예측한다.
-- 중요한 영역은 budget-K refinement Gaussian으로 표현하고, deformable image re-query로 이미지에서 새 정보를 받아 refine한다.
-- 임의 좌표 query는 GaussianFormer-2-style probabilistic superposition으로 평가한다.
-- road surface output은 volume occupancy와 별도 head로 예측한다.
-- road surface geometry는 `z_ground / z_surface`, valid, uncertainty를 핵심 출력으로 둔다.
-- slope, normal, step, roughness는 처음에는 `z_surface`에서 유도하고, 별도 head로 만들지 않는다.
-- semantic surface, traversability, volume semantic은 v1 core head에서 제외하고 나중에 필요한 경우 확장한다.
+- occupied surface는 30cm sparse로, free/unknown 빈 공간은 coarse dense로 만든다 (2-해상도 hybrid).
+- 30cm dense volume feature는 만들지 않는다. sparse deconv + 프루닝으로 점유 후보만 남긴다.
+- volume output은 Tesla 그림처럼 4개 head로 나눈다. 3개(Flow / Sub-Voxel Shape / Semantics)는 occupied voxel에서만 의미가 있어 sparse가 자연스럽다.
+- Occupancy Head만 두 갈래로 나뉜다: free/unknown은 coarse dense, occupied 표면 정밀 경계는 sparse fine.
+- Surface(road geometry)는 Tesla 그림처럼 **별도 출력 브랜치(Surface Outputs head)** 로 둔다. volume head readout이 아니다 (Section 11).
+- Sub-Voxel Shape Information은 별도 예측 경로가 아니라 head다.
+- "보이는 면만 refine"은 Sub-Voxel Shape Head 내부의 exposed-face mask와 masked query execution으로 처리한다.
+- temporal은 **단일 stage @ 0.6m** (ViewFormer-style)로 한다. deconv 1.2m -> 0.6m 직후, deconv 0.6m -> 0.3m 이전의 coarse latent에서 처리한다.
+- Flow는 0.3m sparse로 출력하되, motion 정보는 0.6m temporal에서 온다 (ViewFormer의 BEV-level flow -> voxel 매핑).
+- 1.2m 별도 temporal stage는 두지 않는다 (과보수적, ViewFormer보다도 거칢).
+- full 3D temporal memory, full global temporal attention(0.6m/0.3m), 0.3m temporal, all-voxel heavy local query는 v1에서 금지한다.
 
 ---
 
@@ -205,45 +276,78 @@ Canonical-view REO-style spatial attention
 예측 영역:
 
 ```text
-X axis: rear 10m ~ front 50m = 60m
-Y axis: left 10m ~ right 10m = 20m
-Z axis: -1m ~ +4m = 5m
+X axis: rear 10m ~ front 50m = 60m target = 60.0m grid (격자=타깃)
+Y axis: left 10m ~ right 10m = 20m target, 20.4m internal padded
+Z axis: -2m ~ +4m = 6m target = 6.0m grid (격자=타깃, padding 없음)
 ```
 
-Z 하한이 0이 아니라 -1m인 이유:
+Z를 -2m ~ +4m로 잡은 이유 (약 2m 높이 로봇 기준):
 
 ```text
-내리막 경사 / 경사로 하행 / 연석 아래 / 도로 침하처럼
-ego 기준면보다 낮은 표면을 표현해야 한다.
-차체 pitch만으로도 원거리 바닥이 z=0 아래로 내려간다.
+위 +4m:
+  로봇 키(~2m) 위로 충분한 마진. 낮은 천장 / 육교 / 돌출물의
+  "통과 가능?" 판단에 필요. >4m는 2m 로봇과 무관해 두지 않는다.
+
+아래 -2m (0이 아니라):
+  내리막 경사 / 경사로 하행 / 연석 아래 / 도로 침하 / 구멍처럼
+  ego 기준면보다 낮은 표면과 negative obstacle을 표현해야 한다.
+  pitch만으로도 원거리 바닥이 z=0 아래로 내려간다.
+  -1m보다 1m 더 내려 경사/드롭 마진을 확보했다.
+
 grid의 z축은 차체가 아니라 VIO의 중력 추정에 정렬한다 (Section 20).
-총 높이는 5m로 동일하므로 voxel 수와 비용은 변하지 않는다.
+6m = 20 cells로 딱 떨어지므로 Z는 격자=타깃이며 padding/mask가 없다.
 ```
 
 최종 voxel 크기:
 
 ```text
-voxel_size = 0.2m
+voxel_size = 0.3m
 ```
 
-최종 dense occupancy output 크기:
+내부 grid 크기:
 
 ```text
-X: 60m / 0.2m = 300
-Y: 20m / 0.2m = 100
-Z:  5m / 0.2m = 25
-
-final_output = 300 x 100 x 25 = 750,000 voxels
+0.3m: 200 x 68 x 20 = 272,000 voxels
+0.6m: 100 x 34 x 10 =  34,000 voxels
+1.2m:  50 x 17 x  5 =   4,250 voxels
 ```
 
-중요한 구분:
+valid target ROI는 internal grid 안에서 mask로 관리한다.
 
 ```text
-20cm dense output은 만든다.
-20cm dense feature volume은 만들지 않는다.
+model output 좌표계:
+  200 x 68 x 20 nominal grid
+  (occupied 표면은 이 중 점유 후보만 sparse 활성,
+   free/unknown은 coarse dense에서 관리)
+
+valid target region:
+  원래 목표 범위에 해당하는 cell만 loss / metric / planner에 사용
+
+padded region:
+  ignore mask 또는 low-weight background로 처리
 ```
 
-즉 최종적으로 `300 x 100 x 25` occupancy probability는 출력하지만, 내부에서 `300 x 100 x 25 x C` 형태의 큰 3D feature tensor를 오래 유지하지 않는다.
+30cm feature 비용 감각 (dense였다면):
+
+```text
+만약 F_0.3를 dense로 만들면, C=64, fp16:
+  200 x 68 x 20 x 64 x 2 bytes
+  ~= 34.8 MB
+  (272,000 voxel 전부에 3D conv -> Orin 20Hz 위협)
+```
+
+본 문서는 dense를 만들지 않는다. sparse deconv + 프루닝으로 점유 후보만 남긴다:
+
+```text
+주행 장면의 occupied 비율은 대략 수~십수 %.
+keep ratio 0.4 -> 0.5 적용 시 0.3m 단계 활성 voxel은
+  대략 수만 voxel 수준 (272k의 일부).
+-> 메모리와 3D conv 연산이 dense 대비 크게 감소.
+```
+
+free / unknown 빈 공간은 coarse dense @ 0.6m(100 x 34 x 10 = 34,000 voxel)에서만 dense로 다룬다. 0.6m dense는 voxel 수가 작아(34k) Orin에서 부담 없고, 여기서 temporal(Section 7)과 coarse occupancy를 함께 처리한다. dense 비용이 위험한 곳은 0.3m(272k)뿐이며, 그 단계만 sparse로 만든다.
+
+Jetson AGX Orin 20Hz를 목표로 하면 C는 처음에 48 또는 64로 시작하고, head는 1x1x1 (sparse) conv / light MLP 중심으로 둔다.
 
 ---
 
@@ -256,166 +360,134 @@ multi-camera images
 -> canonical-view preprocessing
 -> image backbone + neck
 -> canonical ray positional embedding
--> calibration-light vanilla spatial attention at 1.6m
--> 1.6m coarse 3D feature
+-> calibration-light vanilla spatial attention at 1.2m
+-> 1.2m spatial 3D feature
 
--> ViewFormer-style streaming temporal module
--> temporally enhanced 1.6m 3D feature
+-> dense deconv: 1.2m -> 0.6m
+-> 0.6m pre-temporal refinement block (BEVDet4D 교훈)
+-> ViewFormer-style single BEV temporal @ 0.6m
+   z-squeeze -> streaming memory(N=3~4) -> 경량 gated conv
+   -> BEV-level flow -> unsqueeze/inject back to 0.6m 3D
+-> temporally enhanced 0.6m 3D feature
 
--> dense deconv 1
--> 0.8m 3D feature
+-> coarse dense occupancy / visibility head @ 0.6m (free/unknown + 프루닝 guide)
 
--> dense deconv 2
--> 0.4m 3D feature
+-> sparse deconv + 프루닝: 0.6m -> 0.3m (keep occupied 후보)
+-> 30cm sparse surface feature (kept voxels only)
 
--> road surface geometry head
--> 300 x 100 z_surface / valid / uncertainty output
+-> Occupancy Head (sparse fine 표면 정밀)
+-> Occupancy Flow Head (0.3m sparse 출력, motion은 0.6m temporal에서)
+-> Sub-Voxel Shape Information Head (sparse + exposed-face masked)
+-> 3D Semantics Head (sparse)
 
--> structured sub-voxel channel head
--> 300 x 100 x 25 dense occupancy output
-
--> dynamic / flow head
--> dynamic probability / occupancy flow output
-
--> active mask selection
--> budget-K Gaussian refinement branch
--> selected voxels initialize refinement Gaussians
--> deformable image re-query refines Gaussian parameters
--> probabilistic queryable evaluation inside selected regions
+-> Surface Outputs head (Tesla처럼 별도 브랜치, dense BEV)
+-> queryable output interface
 ```
 
-해상도별 grid 크기:
+해상도별 역할:
 
 ```text
-0.2m: 300 x 100 x 25 = 750,000 voxels
-0.4m: 150 x  50 x 13 =  97,500 voxels
-0.8m:  75 x  25 x  7 =  13,125 voxels
-1.6m:  38 x  13 x  4 =   1,976 voxels
+1.2m:
+  image-to-3D spatial lifting (vanilla attention)
+  coarse scene / occlusion / long-term context
+
+0.6m (dense):
+  single ViewFormer-style temporal + BEV flow
+  coarse dense occupancy / free / unknown / visibility
+  occupancy 프루닝 guide
+  mid-level geometry refinement
+
+0.3m (sparse):
+  final sparse surface feature (kept voxels only)
+  Tesla-style 4 volume heads
+  Surface Outputs head / queryable occupancy의 feature source
 ```
 
-주의: 이 크기는 실제 예측 영역을 덮기 위한 logical grid 크기다. stride-2 deconv를 깔끔하게 쓰려면 내부 tensor는 padding된 크기로 만들고, 마지막에 valid region만 crop/mask하는 편이 구현이 쉽다.
-
-예:
+`1.2m`에서 spatial attention을 수행하면 `0.6m`에서 attention을 수행하는 것보다 query 수가 크게 줄어든다.
 
 ```text
-1.6m internal: 38 x 13 x 4
-0.8m internal: 76 x 26 x 8
-0.4m internal: 152 x 52 x 16
+1.2m query count:
+  50 x 17 x 5 = 4,250
 
-valid 0.4m region:
-150 x 50 x 13
+0.6m query count:
+  100 x 34 x 10 = 34,000
 ```
 
-최종 20cm query도 valid region 안의 `300 x 100 x 25` voxel center에 대해서만 수행한다.
-
-`1.6m`에서 spatial attention을 수행하면 `0.8m`에서 attention을 수행하는 것보다 query 수가 약 6배 이상 줄어든다. 대신 deconvolution을 두 번 사용해 `0.4m` feature까지 복원한다.
+따라서 image cross-attention은 1.2m에서 수행하고, 30cm occupied 표면 feature는 sparse deconvolution + 프루닝으로 복원한다.
 
 ---
 
-## 2.1 Core Heads and Branches
+## 2.1 Core Volume Heads and Supporting Runtime Modules
 
-이 문서의 v1 core는 너무 많은 head를 두지 않는다. 핵심은 `동적 해상도 복셀 + flow occupancy + 바닥 surface`다.
+이 문서의 core volume heads는 정확히 네 개다(= Tesla "Volume Outputs"). Surface는 별도 브랜치(Section 11), Queryable은 인터페이스(Section 10)다.
 
-따라서 core head / branch는 다음 6개로 본다.
+| Head | 출력 위치 | 역할 |
+|---|---|---|
+| Occupancy Head | coarse dense `100 x 34 x 10` @0.6m (free/unknown/vis) + sparse fine kept voxels (occupied 표면) | occupied / free / unknown / visibility logits |
+| Occupancy Flow Head | 0.3m sparse kept voxels (motion은 0.6m BEV temporal) | dynamic probability, occupancy flow, velocity |
+| Sub-Voxel Shape Information Head | sparse kept voxels + exposed-face masked local query | 30cm voxel 내부의 exposed face, surface offset, normal, shape code, uncertainty |
+| 3D Semantics Head | sparse kept voxels | voxel semantic class |
 
-| Head / Branch | 출력 크기 | 역할 |
-|---|---:|---|
-| Volume Occupancy Head | `300 x 100 x 25` | 각 20cm voxel의 occupied / free / unknown 확률 |
-| Dynamic / Flow Head | `300 x 100 x 25` 또는 active voxel | dynamic probability, occupancy flow, velocity |
-| Road Surface Geometry Head | `300 x 100` | BEV cell마다 바닥/표면의 `z_surface`, valid, uncertainty |
-| Active Mask Head | `0.4m cell` 또는 `20cm voxel` | 어떤 영역을 더 자세히 볼지 선택 |
-| Budget-K Gaussian Refinement Branch | selected `K` Gaussians | 선택된 voxel에서 Gaussian 초기화, deformable image re-query로 파라미터 refine |
-| Probabilistic Queryable Evaluation | query points in selected regions | Gaussian superposition으로 임의 좌표의 continuous occupancy / boundary / normal 평가 |
+별도 출력 브랜치 (Tesla 그림 기준):
 
-구조적으로는 다음처럼 묶는다.
+| 출력 | 위치 | 역할 |
+|---|---|---|
+| Surface Outputs head | dense BEV (Section 11) | z_surface / slope / step / uncertainty |
+| Queryable Outputs | MLP 인터페이스 (Section 10) | 임의 좌표 occupancy / semantic |
+
+아래 항목들은 head가 아니라 runtime/control mechanism이다.
 
 ```text
-Core outputs:
-  1. Volume Occupancy
+Exposed-face mask:
+  Sub-Voxel Shape Head가 어느 face를 자세히 볼지 정한다.
+
+Active / priority mask:
+  planner path, uncertainty, dynamic, visibility frontier 등으로
+  expensive local query budget을 배분한다.
+
+Queryable MLP:
+  Sub-Voxel Shape Head의 shape code와 F_0.3 feature를 사용해
+  임의 좌표 x,y,z의 occupancy / semantic을 평가하는 interface다.
+```
+
+즉 구조적으로는 다음처럼 분리한다.
+
+```text
+Prediction heads:
+  1. Occupancy
   2. Occupancy Flow
-  3. Road / Ground Surface Geometry
+  3. Sub-Voxel Shape Information
+  4. 3D Semantics
 
-Dynamic-resolution refinement:
-  4. Active Mask
-  5. Budget-K Gaussian Refinement
-  6. Probabilistic Queryable Evaluation
-
-Runtime rules inside dynamic-resolution refinement:
-  fixed K quota scheduler
-  distance / planner-aware LOD budget
-  packed batched Gaussian evaluation
+Runtime controls:
+  exposed-face mask
+  active / priority mask
+  query budget scheduler
+  packed query execution
 ```
 
-이 중 `Active Mask + Budget-K Gaussian Refinement + Probabilistic Queryable Evaluation`은 따로따로 독립된 최종 prediction task라기보다, 동적 해상도 복셀을 만들기 위한 하나의 refinement pipeline이다.
-
-```text
-20cm base occupancy
--> active mask로 refine score 계산
--> quota-based Top-K scheduler로 K개 voxel 선택
--> 선택된 voxel center에서 refinement Gaussian 초기화
--> deformable image re-query로 Gaussian 파라미터 refine
--> 모든 query point는 packed batch로 superposition을 한 번에 평가
-```
-
-실시간성을 위해 다음 세 가지 runtime rule을 core에 포함한다.
-
-```text
-1. fixed K budget:
-   매 frame refine할 voxel 수를 제한한다.
-
-2. quota-based selection:
-   boundary / dynamic / planner / uncertainty / near-field가 한쪽에 밀리지 않게 나눠 뽑는다.
-
-3. packed batched query:
-   Gaussian마다 평가를 따로 호출하지 않고, 모든 query point를 Q x 3 batch로 펴서 superposition을 한 번에 평가한다.
-```
-
-v1에서 core head로 두지 않는 것:
-
-```text
-Volume Semantic Head:
-  나중에 semantic occupancy가 필요할 때 추가
-
-Road Surface Semantics / Traversability:
-  나중에 road, curb, ramp, stair, terrain, cost가 필요할 때 추가
-
-Surface Normal / Slope / Step Head:
-  처음에는 z_surface에서 계산
-  필요할 때만 auxiliary head로 분리
-```
+이 구분이 중요하다. `Sub-Voxel Shape Information`은 별도 예측 경로가 아니라 head다. 다만 모든 voxel의 모든 내부 point를 같은 비용으로 query하지 않기 위해, head 내부에서 mask와 budget을 사용한다.
 
 ---
 
 ## 3. Canonical-view REO-style Input
 
-REO의 calibration-free vanilla attention 아이디어를 그대로 쓰되, 실제 하드웨어 변경 유연성을 위해 입력을 canonical view로 정렬한다.
-
-정확한 이름은 순수 `calibration-free`보다 다음에 가깝다.
+입력은 multi-camera image다. raw camera를 그대로 attention에 넣기보다, camera별 이미지를 canonical virtual camera layout으로 정리한다.
 
 ```text
-calibration-light canonical-view REO-style attention
+raw cameras
+-> undistort / rectify
+-> canonical virtual views
+-> shared image backbone
 ```
 
-입력 전처리:
+목표:
 
-```text
-raw camera image
--> undistortion
--> rectification
--> virtual camera layout으로 정렬
--> fixed crop / resize
--> canonical ray grid 생성
-```
+- camera intrinsics / extrinsics 변화에 덜 민감하게 만든다.
+- REO-style calibration-light attention이 학습하기 쉬운 입력을 만든다.
+- hardware-specific camera id에 과하게 묶이지 않게 한다.
 
-목적:
-
-- 카메라 하드웨어가 바뀌어도 downstream network는 같은 virtual camera layout을 보게 한다.
-- 실제 intrinsic/extrinsic 변화는 preprocessing adapter에서 최대한 흡수한다.
-- attention 모듈은 매번 다른 raw camera geometry를 직접 학습하지 않아도 된다.
-
-주의:
-
-depth 없이 이미지를 완전히 다른 physical viewpoint로 재투영할 수는 없다. 여기서 말하는 canonical view는 완전한 3D reprojection이 아니라, 렌즈/화각/방향을 정규화한 ray-aligned image representation에 가깝다.
+canonical view는 완전한 calibration-free가 아니다. 하지만 model 내부 attention이 raw projection table에 직접 묶이지 않도록, 입력을 hardware-flexible한 virtual camera space로 옮긴다.
 
 ---
 
@@ -456,7 +528,7 @@ camera id에 과하게 overfit되는 embedding
 
 ### Auxiliary Depth Supervision (Training-only)
 
-vanilla cross-attention은 projection 힌트 없이 3D 대응을 데이터로만 학습하므로, 수렴이 느리고 데이터 요구량이 크다. 이를 완화하기 위해 학습 시에만 image feature 위에 작은 per-pixel depth head를 둔다 (BEVDepth 계열의 교훈).
+vanilla cross-attention은 projection 힌트 없이 3D 대응을 데이터로만 학습하므로, 수렴이 느리고 데이터 요구량이 커질 수 있다. 이를 완화하기 위해 학습 시에만 image feature 위에 작은 per-pixel depth head를 둔다.
 
 ```text
 학습 시:
@@ -474,13 +546,13 @@ depth GT 소스:
   추론 비용 증가 0
 ```
 
-효과: depth를 맞추려면 image feature가 "이 픽셀이 얼마나 먼 표면인지"를 인코딩해야 하고, 그 feature는 cross-attention의 3D 대응 학습을 직접 돕는다. 추론 비용이 0이므로 v1 학습에 기본 포함한다.
+효과: depth를 맞추려면 image feature가 "이 픽셀이 얼마나 먼 표면인지"를 인코딩해야 하고, 그 feature는 cross-attention의 3D 대응 학습을 직접 돕는다.
 
 ---
 
-## 5. Coarse Spatial Attention at 1.6m
+## 5. Coarse Spatial Attention at 1.2m
 
-spatial attention은 20cm나 40cm가 아니라 `1.6m` coarse grid에서 수행한다.
+spatial attention은 최종 30cm가 아니라 `1.2m` coarse grid에서 수행한다.
 
 이 단계의 attention은 명시적으로 **vanilla cross-attention**이다.
 
@@ -497,907 +569,788 @@ spatial attention은 20cm나 40cm가 아니라 `1.6m` coarse grid에서 수행�
 단, canonical ray positional embedding과 virtual camera layout은 사용한다. 따라서 이 구조는 완전한 무기하 attention이라기보다, hardware-flexible한 `calibration-light vanilla attention`에 가깝다.
 
 ```text
-coarse_query_grid = 38 x 13 x 4
-num_queries ~= 1,976
+coarse_query_grid = 50 x 17 x 5
+num_queries = 4,250
 ```
 
 기본 형태:
 
 ```text
-Q: 1.6m 3D voxel query positional embedding
+Q: 1.2m 3D voxel query positional embedding
 K: multi-camera image tokens + canonical ray positional embedding
 V: multi-camera image features
 
-coarse_3d_feature = VanillaCrossAttention(Q, K, V)
+F_1.2_raw = VanillaCrossAttention(Q, K, V)
 ```
-
-이 방식은 REO의 vanilla cross-attention 아이디어를 3D coarse query에 적용한 형태다. REO 원 논문은 BEV query를 중심으로 설명하지만, 여기서는 Tesla-style occupancy를 위해 low-resolution 3D voxel query를 사용한다.
 
 장점:
 
-- `0.8m` attention보다 query 수가 훨씬 적다.
+- 0.6m attention보다 query 수가 8배 적다.
 - calibration projection에 과하게 의존하지 않는다.
 - canonical ray positional embedding 덕분에 완전 무기하 attention보다 수렴이 안정적이다.
 
 위험:
 
-- 너무 coarse한 query는 얇은 물체나 작은 장애물 정보를 놓칠 수 있다.
-- 그래서 `3.2m` attention까지 낮추는 것은 초기 버전에서는 피한다.
+- raw 1.2m feature는 아직 image-to-3D lifting 직후라 noise가 있고, 주변 voxel context가 부족할 수 있다.
+- 그래서 1.2m attention 직후 바로 temporal에 넣지 않는다. dense deconv로 0.6m까지 올린 뒤, 0.6m에서 pre-temporal refinement를 거쳐 temporal을 수행한다 (Section 6, 7).
 
 권장 시작점:
 
 ```text
-1.6m attention
--> ViewFormer-style temporal module
--> 0.8m deconv
--> 0.4m deconv
--> 20cm query
+1.2m attention
+-> dense deconv 1.2m -> 0.6m
+-> 0.6m pre-temporal refinement
+-> ViewFormer-style single BEV temporal @ 0.6m
+-> coarse dense occupancy @ 0.6m
+-> sparse deconv + prune 0.6m -> 0.3m
+-> 4 volume heads (+ Surface Outputs head)
 ```
 
 ---
 
-## 6. ViewFormer-style Streaming Temporal Module
+## 6. Pre-temporal Feature Refinement
 
-temporal module은 ViewFormer의 핵심 아이디어를 접목한다.
-
-핵심은 다음과 같다.
+pre-temporal refinement는 dense deconv로 0.6m까지 올린 feature를 바로 과거 feature와 align하지 않고, 현재 frame 내부에서 한 번 정리하는 작은 block이다. 위치는 **deconv(1.2m->0.6m) 직후, temporal 직전**이다.
 
 ```text
-3D voxel feature를 그대로 과거 프레임 memory에 저장하지 않는다.
-z축을 squeeze해서 BEV memory로 저장한다.
-ego-motion으로 과거 BEV feature를 현재 좌표계에 align한다.
-aligned memory와 현재 BEV feature 사이에 temporal attention을 수행한다.
-temporal BEV context를 다시 현재 3D feature에 주입한다.
+F_1.2 -> dense deconv -> F_0.6_raw
+-> light 3D / BEV feature cleanup
+-> F_0.6_refined
+-> ViewFormer-style temporal @ 0.6m
 ```
 
-현재 구조에서는 temporal module을 `1.6m coarse 3D feature` 직후에 둔다.
+왜 1.2m attention 직후가 아니라 0.6m에서 하는가:
 
 ```text
-current 1.6m 3D feature
--> z-squeeze / height pooling
--> current 1.6m BEV feature
--> ego-motion aligned BEV memory
--> streaming temporal attention
--> temporal BEV context
--> restore / inject into 1.6m 3D feature
--> temporally enhanced 1.6m 3D feature
+BEVDet4D 교훈:
+  view transformer(여기서는 1.2m attention) 직후 feature는
+  너무 coarse해서 temporal cue를 바로 쓰면 velocity error가 오른다(+11.9%).
+  temporal 전에 extra encoder로 한 번 정리하는 것이 적절하다.
+
+따라서:
+  1.2m attention -> dense deconv 0.6m -> 0.6m refinement -> temporal
 ```
 
-권장 tensor 흐름:
+refinement 대상 F_0.6_raw의 문제:
 
 ```text
-F3D_t:
-  38 x 13 x 4 x C
+F_0.6_raw:
+  1.2m attention feature를 deconv로 올린 것
+  voxel 주변 context가 부족할 수 있음
+  noise / ghost feature가 있을 수 있음
+  temporal memory와 비교하기에 표현이 불안정할 수 있음
+```
 
-B_t = ZPool(F3D_t):
-  38 x 13 x Cb
+pre-temporal refinement는 큰 모듈이 아니다. 추가 camera attention이 아니라, 작은 3D/BEV conv block이다.
 
-B08_t = Upsample2x(B_t):
-  75 x 25 x Cb
-  저장 / warp 해상도
+추천 최소 구현:
+
+```text
+F_0.6_raw: 100 x 34 x 10 x C
+
+1x1x1 conv:
+  C -> Cb
+
+light 3D block:
+  depthwise 3D conv 3x3x3
+  + pointwise 1x1x1 conv
+  + residual / gating
+
+F_0.6_refined:
+  100 x 34 x 10 x Cb
+```
+
+v1 추천:
+
+```text
+F_0.6_refined = F_0.6_raw + LightRes3DBlock(F_0.6_raw)
+B_0.6 = ZPool(F_0.6_refined)   # temporal은 BEV에서
+```
+
+---
+
+## 7. ViewFormer-style Single Temporal Stage at 0.6m
+
+Tesla AI Day 2022 그림을 구조적으로 읽으면 temporal alignment는 deconvolution 이후의 고해상도 volume feature가 아니라, spatial attention 이후 deconvolution 이전의 coarse latent에서 수행된다. 본 문서도 그 원칙(temporal before final deconv)을 따른다. 다만 그 coarse latent를 **0.6m 단일 stage**로 둔다.
+
+### 7.1 왜 0.6m 단일 stage인가 (1.2m이 아니라)
+
+```text
+Tesla:     ~4.8m latent에서 temporal (30cm final, ×16 deconv).
+           거대 ROI + ×16 deconv + 커스텀 HW라서 가능.
+ViewFormer: ~0.8m voxel query를 BEV로 squeeze해서 temporal.
+           flow를 위해 fine-grained motion이 필요해 0.8m를 택함.
+우리:      ROI 작고(Z 6m), deconv ×4뿐, Orin.
+           Tesla의 4.8m는 Z가 붕괴(6/4.8≈1)해서 불가능.
+           ViewFormer의 0.8m에 가장 가까운 Orin-feasible 지점이 0.6m.
+```
+
+판단:
+
+```text
+1.2m temporal:
+  Tesla "coarsest" 원칙엔 맞지만, ViewFormer(0.8m)보다도 거칢.
+  flow에서 motion이 한 cell(30cm 4x4)에 평균화됨. 과보수적.
+
+0.6m temporal:
+  ViewFormer ~0.8m에 근접. flow에 적합.
+  Z=10층 확보(붕괴 없음). 여전히 deconv 이전 coarse latent.
+  비용은 operator로 통제(아래) -> Orin 가능.
+
+-> v1 main temporal은 0.6m 단일 stage. 1.2m 별도 temporal stage는 두지 않는다.
+```
+
+비용의 핵심은 해상도가 아니라 **operator**다.
+
+```text
+0.6m BEV = 100 x 34 = 3,400 cells
+
+full self-attention:  3,400^2 = 11.56M  -> 금지
+gated / depthwise separable conv:  cell 수에 선형 -> 매우 쌈
+history N=4 메모리:  100 x 34 x 64 x 2B ≈ 0.44MB/frame -> 무시 가능
+
+ViewFormer가 3090에서 4 FPS인 것은 0.8m라서가 아니라
+temporal attention을 무겁게 했기 때문이다. 우리는 경량 conv로 한다.
+```
+
+### 7.2 ViewFormer-style 흐름 (z-squeeze -> temporal -> unsqueeze -> flow)
+
+ViewFormer는 voxel query를 z축으로 squeeze해 BEV query로 만들고, BEV에서 streaming temporal을 한 뒤 다시 voxel로 unsqueeze해서 occupancy와 occupancy flow를 함께 예측한다. flow는 BEV-level로 예측하고 각 voxel cell에 매핑한다. 본 문서도 동일하게 한다.
+
+```text
+F_0.6_refined: 100 x 34 x 10 x C
+
+B_0.6_t = ZPool(F_0.6_refined):
+  100 x 34 x Cb   (z-squeeze to BEV)
 
 Memory:
-  [B08_{t-1}, B08_{t-2}, B08_{t-3}, ...]
-  keyframe 간격 ~0.2s (연속 frame이 아니라 시간 간격 기반)
+  [B_0.6_{t-1}, B_0.6_{t-2}, B_0.6_{t-3}]
+  keyframe 간격 ~0.2s (0.6~0.8s 창)
 
 Aligned memory:
-  Warp(B08_{t-k}, pose_{t-k -> t})
-  0.8m grid에서 수행
+  Warp(B_0.6_{t-k}, pose_{t-k -> t})   (ego-motion)
 
-B_temporal:
-  TemporalAttention(query=B08_t, key/value=aligned_memory)
+B_0.6_temporal:
+  LightGatedTemporalFusion(B_0.6_t, aligned_memory)   (NOT full attention)
 
-F3D_temporal:
-  F3D_t + Inject3D(AvgPool2x(B_temporal), z_embedding)
+BEV-level flow:
+  F_flow_bev = FlowHead_BEV(B_0.6_temporal)
+  -> dynamic_logit, vx, vy, (vz)  per BEV cell
+
+Unsqueeze / inject:
+  F_0.6_temporal = Inject3D(F_0.6_refined, B_0.6_temporal, z_embedding)
+  flow는 BEV cell -> 그 column의 voxel로 매핑 (최종 0.3m sparse voxel까지 broadcast)
 ```
 
-`ZPool`은 단순 mean/max pooling으로 시작할 수 있지만, 최종적으로는 learned height pooling이 더 좋다.
+### 7.3 temporal fusion operator (v1 / v1.5)
 
 ```text
-ZPool options:
-  mean pooling over z
-  max pooling over z
-  learned weighted pooling over z
-  attention pooling over z
-```
+권장 v1:
+  ego-motion warp
+  concatenate current + aligned history
+  depthwise / separable BEV conv
+  gated residual fusion
 
-`Inject3D`는 temporal BEV context를 z축으로 broadcast한 뒤, z positional embedding과 함께 현재 3D feature에 residual/gating 방식으로 더한다.
-
-```text
-Inject3D(B_temporal, z_embedding):
-  broadcast B_temporal to X x Y x Z
-  concatenate or add z_embedding
-  1x1x1 conv / MLP
-  residual or FiLM-style gating
+v1.5 이후 검토:
+  local / windowed temporal attention (full global은 계속 금지)
+  limited deformable sampling
 ```
 
 추천 memory 길이:
 
 ```text
-N_history = 3 or 4 keyframes
+N_history = 3 keyframes
 keyframe 간격 ~0.2s
-
-20 FPS 연속 4 frame은 0.15~0.2s 창이라
-occlusion / 가려진 물체 추론에 너무 짧다.
-시간 간격 기반으로 띄엄띄엄 저장해 0.6~0.8s 창을 확보한다.
 ```
 
-memory는 0.4m feature도, 1.6m BEV도 아닌 **0.8m BEV feature**로 저장하고 warp한다.
+20 FPS 연속 frame은 창이 0.15~0.2s로 occlusion 추론에 너무 짧다. 시간 간격 기반으로 띄엄띄엄 저장해 0.6~0.8s 창을 확보한다.
 
-이유:
-
-- 3D feature memory보다 훨씬 작다. (0.8m BEV 4 keyframes, C=64 fp16 기준 약 1MB)
-- ego-motion alignment를 BEV plane에서 간단하게 처리할 수 있다.
-- ViewFormer처럼 temporal interaction 비용을 낮출 수 있다.
-- 1.6m로 저장하면 warp가 망가진다: 10m/s 주행 시 frame당 이동 0.5m는 1.6m cell의 1/3이라, sub-cell 이동이 보간으로 매 frame 번져 기억이 흐려진다. 0.8m는 같은 이동을 절반의 상대 오차로 정렬한다.
-
-주의:
-
-- BEV로 z축을 squeeze하면 height 정보 일부가 손실될 수 있다.
-- 따라서 temporal context는 3D feature를 대체하지 않고, 현재 1.6m 3D feature에 보조 context로 주입한다.
-- 높이가 중요한 물체나 경사로 표현은 현재 frame의 3D feature와 z embedding에 맡긴다.
-
-첫 프레임 또는 memory가 부족한 경우:
+BEV grid 비교 (operator 비용 감각):
 
 ```text
-if memory is empty:
-  B_temporal = B08_t
-else:
-  B_temporal = TemporalAttention(B08_t, aligned_memory)
+1.2m BEV:  50 x 17 = 850 cells
+0.6m BEV:  100 x 34 = 3,400 cells   <- 본 문서 temporal 위치
+0.3m BEV:  200 x 68 = 13,600 cells  <- temporal 금지
 ```
 
-학습 시에는 temporal robustness를 위해 다음 augmentation을 사용한다.
+금지:
 
 ```text
-history frame dropout
-pose noise
-time gap jitter
-memory detach / truncated BPTT
-```
-
-추가 head:
-
-```text
-dynamic probability
-occupancy flow / velocity
-```
-
-temporal module을 넣으면 final occupancy뿐 아니라 dynamic object, motion consistency, occupancy flow를 같이 학습하기 쉬워진다.
-
----
-
-## 7. Coarse-to-fine Dense Deconvolution
-
-PanoOcc-style coarse-to-fine decoder를 사용하되, dense deconv는 `0.4m`까지만 수행한다.
-
-```text
-1.6m coarse 3D feature
--> deconv block 1
--> 0.8m 3D feature
-
--> deconv block 2
--> 0.4m 3D feature
-```
-
-구현상 deconv 출력 크기는 stride-2에 맞춘 padded internal grid로 잡고, 예측 범위를 벗어나는 padding voxel은 valid mask로 제외한다.
-
-```text
-deconv internal:
-38 x 13 x 4
--> 76 x 26 x 8
--> 152 x 52 x 16
-
-valid feature:
-150 x 50 x 13
-```
-
-비추천:
-
-```text
-1.6m
--> 0.8m
--> 0.4m
--> 0.2m dense feature
-```
-
-`0.2m` dense feature volume은 너무 크다.
-
-```text
-300 x 100 x 25 x C
-```
-
-예를 들어 fp16, 64 channels라면 feature tensor 하나만 약 96MB가 된다. 여기에 deconv 중간 activation, normalization, residual, training gradient가 붙으면 메모리와 latency가 크게 증가한다.
-
-따라서 dense feature는 여기서 멈춘다.
-
-```text
-0.4m dense feature = 150 x 50 x 13 x C
+0.3m temporal (cell 4배, Orin 위협)
+0.6m / 0.3m full global temporal attention
+full 3D temporal memory (BEV squeeze로 대체)
 ```
 
 ---
 
-## 8. Road Surface Geometry Output
+## 8. Deconvolution to 30cm (0.6m dense -> 0.3m sparse)
 
-Tesla 발표 그림의 `Road Surface Geometry`에 해당하는 출력은 3D volume occupancy와 별도 head로 둔다.
+해상도 단계를 비용에 맞게 나눈다. dense 비용이 위험한 곳은 0.3m(272k voxel)뿐이므로, **1.2m->0.6m는 dense로 두고(temporal/coarse occupancy가 여기 산다), 0.6m->0.3m만 sparse deconv + 프루닝**으로 만든다. PanoOcc의 coarse-to-fine sparse 업샘플 아이디어를 이 마지막 단계에 적용한다.
 
-중요한 전제:
+### 8.1 단계별 정리
 
 ```text
-road surface output은 3D occupancy의 특정 z slice가 아니다.
-0.4m dense 3D feature에서 별도 surface BEV feature를 만들고,
-그 feature에서 20cm BEV surface geometry를 예측한다.
+F_1.2 (dense, 50 x 17 x 5)
+-> dense deconv -> F_0.6 (dense, 100 x 34 x 10)
+-> 0.6m pre-temporal refinement (Section 6)
+-> ViewFormer-style temporal @ 0.6m (Section 7) -> F_0.6_temporal (dense)
+
+[여기서 두 갈래]
+
+갈래 1) Coarse Dense Occupancy Head @ 0.6m:
+  occupied / free / unknown / visibility logits (dense, 100 x 34 x 10)
+  -> free vs unknown 구분의 dense source
+  -> 동시에 0.3m sparse 프루닝을 guide
+
+갈래 2) Sparse Deconv + Prune (0.6m -> 0.3m):
+  F_0.6_temporal -> upsample -> per-voxel occupancy score
+  -> keep_ratio만 keep -> F_0.3_sparse (occupied/boundary voxels only)
 ```
 
-권장 feature 흐름:
+0.6m을 dense로 두는 이유:
 
 ```text
-0.4m dense 3D feature
-  150 x 50 x 13 x C
-
--> learned z-pooling / surface query pooling
--> surface BEV feature
-  150 x 50 x Cs
-
--> BEV upsample or 20cm surface query
--> 20cm surface BEV feature
-  300 x 100 x Cs
-
--> road surface geometry head
+0.6m dense = 100 x 34 x 10 = 34,000 voxel.
+3D conv가 가볍고, z-squeeze BEV temporal과 coarse dense occupancy를
+여기서 한 번에 처리할 수 있다.
+반면 0.3m dense = 272,000 voxel -> 이 단계만 sparse로 피한다.
 ```
 
-`z-pooling`은 단순 mean/max pooling으로 시작할 수 있지만, 최종적으로는 learned pooling 또는 surface query pooling이 더 좋다. 표면은 보통 3D volume 전체가 아니라 특정 높이 근처에 있으므로, z축 전체를 동일하게 압축하면 바닥 단서가 흐려질 수 있다.
+4개 volume head는 `F_0.3_sparse`의 살아남은 voxel 위에 붙는다. Occupancy Head만 coarse dense 갈래(free/unknown)를 0.6m에서 추가로 갖는다.
 
-geometry head는 BEV cell마다 주행/이동 가능한 주요 표면의 높이와 형상을 예측한다.
+### 8.2 Prune (keep ratio)
 
-v1 core 출력:
+PanoOcc는 sparse deconv에서 keep ratio 0.2 / 0.5 / 0.5를 쓴다. 그러나 본 문서는 **front 50m 원거리 + camera-only**라 공격적으로 자르면 먼 물체나 얇은 구조물이 영구히 사라진다(프루닝은 되돌릴 수 없다).
 
 ```text
-z_ground / z_surface:
-  각 (x, y) 위치의 대표 바닥/표면 높이
+권장 keep ratio (PanoOcc보다 보수적):
+  0.6m -> 0.3m: 0.5 (occupied recall 우선)
 
-valid / unknown:
-  해당 위치에 신뢰할 수 있는 표면이 있는지
-
-uncertainty:
-  카메라 가림, 원거리, texture 부족, multi-layer 구조에 대한 불확실성
+거리 적응:
+  far-field(원거리)는 keep ratio를 더 높이거나
+  occupancy score threshold를 낮춰 보호한다.
 ```
 
-derived output:
+프루닝 결정은 0.6m coarse dense occupancy head의 occupied 확률로 한다(별도 score 헤드 불필요). multi-scale occupancy supervision을 받는다.
+
+### 8.3 이전 버전과의 차이
 
 ```text
-normal / slope:
-  표면 법선과 기울기
-  z_surface의 spatial gradient에서 유도
+이전:
+  dense feature를 0.3m까지 만들고, 4 head를 F_0.3 dense 위에 붙임
 
-step height / height discontinuity:
-  curb, speed bump, pothole, stair처럼 높이 변화가 큰 위치
-  z_surface gradient peak에서 후보 생성
-
-roughness:
-  표면 요철 정도
-  local height variance에서 유도
+현재:
+  0.6m까지 dense, 0.3m는 sparse deconv + 프루닝.
+  free/unknown은 0.6m coarse dense, occupied 표면은 0.3m sparse fine.
+  30cm dense feature volume은 만들지 않는다.
 ```
 
-따라서 초기 구현에서 실제 head가 직접 예측하는 것은 다음 세 개다.
+v1 권장 channel:
 
 ```text
-z_surface(x, y)
-valid_or_unknown(x, y)
-surface_uncertainty(x, y)
+F_1.2: C = 96 or 128   (dense)
+F_0.6: C = 64 or 96    (dense, temporal/coarse occ)
+F_0.3: C = 48 or 64    (sparse)
 ```
 
-normal, slope, roughness는 먼저 `z_surface`에서 미분해 만든다.
+### 8.4 배포 주의 (sparse conv)
 
 ```text
-dz/dx, dz/dy -> normal / slope
-local height variance -> roughness
-height gradient peak -> step / curb 후보
-```
+sparse 3D conv (spconv / torchsparse / Minkowski 류):
+  연산량은 dense보다 크게 줄지만
+  TensorRT가 네이티브로 잘 못 돕는다.
+  Orin에서는 커스텀 커널 / 플러그인이 필요하고
+  FP16 최적화가 dense보다 까다롭다.
 
-이후 성능이 부족하면 normal, slope, step을 별도 auxiliary head로 분리할 수 있다. 하지만 v1 core에서는 별도 head로 두지 않는다.
-
-### Optional Surface Semantics
-
-surface semantics와 traversability는 지금 core head가 아니다. Road Surface Geometry Head가 안정된 뒤, 필요하면 다음 class/cost를 optional extension으로 붙인다.
-
-```text
-surface class:
-  road / lane marking / curb / sidewalk / ramp / stair / terrain / unknown
-
-traversability / cost:
-  platform-conditioned moving feasibility
-```
-
-중요한 점은 `surface class`와 `traversability`를 분리하는 것이다. 예를 들어 `stair`는 같은 class라도 차량에는 이동 불가, 족형 로봇에는 조건부 이동 가능일 수 있다.
-
-### Stair / Ramp / Curb Handling
-
-계단 같은 구조도 표현 가능하다. 다만 v1에서는 `stair semantic`을 직접 분류하기보다, surface geometry와 volume occupancy, adaptive query가 계단 구조를 드러내도록 한다.
-
-v1에서 보는 방식:
-
-```text
-surface geometry:
-  tread 후보의 z_surface
-  step / edge 후보는 z_surface gradient로 유도
-
-volume occupancy:
-  riser / vertical face / obstacle boundary 표현
-
-budget-K Gaussian refinement:
-  선택된 step / boundary voxel을 refinement Gaussian으로 더 세밀하게 표현
-```
-
-나중에 semantics/traversability를 추가하면 다음처럼 확장할 수 있다.
-
-```text
-semantic class:
-  stair
-
-surface role:
-  tread / riser / boundary
-
-traversability:
-  platform-conditioned probability or cost
-```
-
-플랫폼별 해석:
-
-```text
-passenger vehicle:
-  stair -> non-traversable
-
-wheeled robot:
-  stair -> mostly non-traversable
-  ramp -> traversable 가능
-
-legged robot:
-  stair tread -> conditionally traversable
-  stair riser -> obstacle / boundary
-  cost -> high
-```
-
-즉 "계단도 이동 가능하다"는 절대 semantic이 아니라 플랫폼 조건부 affordance다.
-
-height-map 형태의 surface geometry는 기본적으로 한 `(x, y)` 위치에 하나의 대표 surface 높이를 예측한다. 이 방식은 도로, 경사로, 연석, 계단의 tread에는 잘 맞지만, overpass나 다층 구조처럼 한 `(x, y)`에 여러 surface가 있는 장면에는 한계가 있다.
-
-초기 버전의 처리:
-
-```text
-one primary surface per (x, y)
-multi-layer / ambiguous region -> unknown or high uncertainty
-vertical riser / wall-like face -> volume occupancy + budget-K Gaussian refinement에서 처리
-```
-
-나중에 필요하면 multi-surface head로 확장한다.
-
-```text
-z_surface_1, z_surface_2, ...
-surface_valid_1, surface_valid_2, ...
-```
-
-하지만 첫 구현에서는 하나의 대표 `z_surface`와 uncertainty를 두는 편이 낫다.
-
-### Consistency with Volume Occupancy
-
-surface output과 volume output은 서로 독립적으로 아무렇게나 예측되면 안 된다. 다음 consistency가 필요하다.
-
-```text
-surface z 주변:
-  occupied / boundary probability가 높아야 함
-
-surface 위쪽:
-  free 또는 unknown이어야 함
-
-curb / stair / step 위치:
-  height discontinuity와 occupancy boundary가 같이 나타나야 함
-
-drivable surface:
-  volume occupancy에서 obstacle과 충돌하면 안 됨
-```
-
-권장 loss:
-
-```text
-L_surface_height:
-  Huber or L1 on z_surface with valid mask
-
-L_surface_valid:
-  BCE or focal loss
-
-L_surface_semantic:
-  CE or focal loss
-  optional extension에서만 사용
-
-L_surface_normal:
-  1 - dot(normal_pred, normal_gt)
-  or derived-normal consistency from z_surface
-
-L_surface_smooth:
-  edge-aware smoothness
-  semantic boundary와 step에서는 smoothness 약화
-
-L_occ_surface_consistency:
-  surface height와 occupancy boundary 정합
-```
-
-이 surface branch의 목적은 planner/control이 바로 쓸 수 있는 `2.5D ground/surface geometry`를 만드는 것이다. 3D occupancy는 전체 장애물과 빈 공간을 말해주고, road surface geometry head는 "바닥/표면이 어디에 있고 얼마나 믿을 수 있는지"를 더 직접적으로 알려준다.
-
----
-
-## 9. 20cm Dense Output Head
-
-최종 20cm occupancy는 20cm dense feature volume을 만들어서 예측하지 않는다. 하지만 20 FPS v1에서는 모든 20cm voxel을 `GridSample + MLP`로 하나씩 query하는 방식도 피한다.
-
-20 FPS v1의 기본 dense output은 structured sub-voxel channel head로 만든다.
-
-```text
-0.4m dense feature:
-  150 x 50 x 13 x C
-
--> small 1x1x1 conv / MLP head
--> each 0.4m cell predicts 2 x 2 x 2 sub-voxel logits
--> reshape / crop
--> 300 x 100 x 25 dense occupancy
-```
-
-이 방식은 20cm dense feature를 만들지 않으면서도, 모든 20cm voxel logit을 빠르게 만든다.
-
-```text
-0.4m feature tensor:
-  유지한다.
-
-20cm dense feature tensor:
-  만들지 않는다.
-
-20cm dense occupancy logits:
-  structured channel output으로 만든다.
-```
-
-임의 좌표 query와 selected voxel 내부의 정밀화는 dense 경로가 아니라 budget-K Gaussian refinement branch가 담당한다 (Section 10, 11).
-
-```text
-selected x, y, z points
--> 주변 refinement Gaussian 탐색
--> GaussianFormer-2-style probabilistic superposition 평가
--> occupancy / unknown / local surface-boundary probability
-```
-
-이 구조는 Tesla demo의 queryable occupancy 성격과 잘 맞는다.
-
-핵심:
-
-```text
-0.4m까지는 dense feature
-0.2m는 dense output logits
-0.2m dense feature는 만들지 않음
-all-voxel dense output은 structured head
-selected fine refinement는 budget-K Gaussian branch
+-> "TensorRT FP16 기본"(Section 13) 목표와 충돌하는 지점.
+   엔지니어링 비용과 커널 최적화 리스크를 v1에서 감수 대상으로 명시한다.
+   sparse 배포가 막히면 fallback은:
+     coarse 해상도는 dense, 0.3m 단계만 masked dense (frustum/ROI crop)로 근사.
 ```
 
 ---
 
-## 10. Budget-K Gaussian Refinement Branch
+## 9. Tesla-style 4 Volume Heads
 
-선택된 영역의 fine refinement는 GaussianFormer / GaussianFormer-2 아이디어를 budget-bounded 형태로 가져온 branch로 수행한다. 이전 초안의 `sparse local feature anchor + exposed-face adaptive point query` 조합은 이 branch로 대체한다.
-
-대체 이유:
+head는 `F_0.3_sparse`(살아남은 occupied/boundary 표면 voxel)와 coarse dense occupancy feature 두 source 위에 붙는다.
 
 ```text
-1. 정보 병목 해소:
-   기존 refinement는 0.4m feature를 다시 sampling하는 구조라
-   1.6m lifting 이후 이미지에서 새 정보가 들어오지 않았다.
-   Gaussian의 deformable image re-query는 선택 영역만
-   이미지 feature를 다시 읽는 budget-bounded local re-query다.
+Coarse dense (0.6m)
+└── Occupancy Head (free / unknown / visibility 갈래)
 
-2. latency 구조 단순화:
-   probe -> boundary search의 순차 query 루프가
-   single feed-forward refinement로 바뀐다.
+F_0.3_sparse (kept voxels)
+├── Occupancy Head (occupied 표면 정밀 갈래)
+├── Occupancy Flow Head (0.3m 출력, motion은 0.6m temporal)
+├── Sub-Voxel Shape Information Head
+└── 3D Semantics Head
 
-3. analytic surface 표현:
-   covariance에서 surface normal과 local 두께가 직접 나온다.
-   anisotropic scale이 20cm grid보다 얇은 구조를 표현할 수 있다.
-
-4. queryable 표현 일치:
-   probabilistic superposition은 임의 좌표 x에서
-   p(occupied | x)를 closed-form으로 평가한다.
-   Tesla demo의 queryable occupancy 인터페이스와 같다.
+(Surface Outputs head는 별도 브랜치 - Section 11)
 ```
 
-GaussianFormer 원본을 그대로 쓰지 않는다. 원본은 desktop GPU에서도 수백 ms급이다 (GaussianFormer-2 기준 RTX 4090에서 6,400 Gaussians에 약 313ms, 그중 이미지 기반 초기화 모듈만 약 142ms). 따라서 다음과 같이 비용 요소를 제거한 형태로만 가져온다.
+설계 원리: Flow / Sub-Voxel Shape / Semantics 세 head는 **occupied voxel에서만 의미**가 있으므로 sparse가 자연스럽다(빈 공간엔 flow도 표면도 semantic도 없다). Occupancy Head만 "빈 공간의 free/unknown"이라는 추가 책임이 있어 coarse dense 갈래를 함께 갖는다. Sub-Voxel Shape Information Head는 sparse 표면 voxel 중에서도 exposed face가 있는 voxel만 골라 masked execution을 사용한다.
+
+### 9.1 Occupancy Head (2-갈래)
+
+Occupancy Head는 두 갈래로 나뉜다. free/unknown은 빈 공간의 저주파 속성이라 coarse dense에서, occupied 표면의 정밀 경계는 sparse fine에서 예측한다.
 
 ```text
-가져오지 않는 것:
-  이미지에서 Gaussian을 직접 생성하는 초기화 모듈
-  전체 장면의 Gaussian 표현 (수만 개 단위)
-  full-scene Gaussian-to-voxel splatting CUDA op
+갈래 A: Coarse Dense Occupancy / Visibility (@ 0.6m)
+  input:  F_0.6_temporal (dense, 100 x 34 x 10 x C)
+  output: occupied / free / unknown / visibility logits
+  역할:   빈 공간 free vs unknown 구분 (프루닝 / queryable의 기준)
+  또한 이 occupancy score가 0.6m->0.3m sparse deconv 프루닝을 guide한다.
 
-가져오는 것:
-  Gaussian 파라미터화: mean / scale / rotation / opacity / feature
-  deformable image re-query 기반 파라미터 refinement
-  GaussianFormer-2-style probabilistic superposition 평가
+갈래 B: Sparse Fine Occupied Surface (@ 0.3m)
+  input:  F_0.3_sparse (kept voxels)
+  output: 살아남은 voxel의 occupied 확률 / 표면 경계 정밀화
+  역할:   30cm 표면 정밀 occupancy
 ```
 
-비용 제거가 가능한 이유는 base 경로가 이미 있기 때문이다. base dense occupancy는 structured head가 만들고, active mask + quota Top-K가 "어디에 Gaussian이 필요한지"를 이미 알려주므로, Gaussian은 이미지 기반 초기화 모듈 없이 selected voxel에서 바로 시작한다.
+권장 시작:
 
-### Gaussian Initialization
+```text
+# 갈래 A (dense @ 0.6m)
+O_occ_coarse = Conv1x1x1(F_0.6_temporal)
+  -> 100 x 34 x 10 x (3 또는 occ+vis)
+
+# 갈래 B (sparse @ 0.3m)
+O_occ_fine = SparseConv1x1x1(F_0.3_sparse)
+  -> [N_kept] x 1   (kept voxel별 occupied 정밀 logit)
+```
+
+unknown을 명시적으로 두는 이유:
+
+```text
+free:
+  camera ray가 지나간 관측된 빈 공간
+
+unknown:
+  보이지 않았거나 occlusion 뒤라 판단 불가능한 공간
+
+occupied:
+  표면 / 물체가 있는 공간
+```
+
+free와 unknown을 구분하지 않으면, 카메라 뒤쪽 occluded 영역을 잘못 free로 학습할 위험이 크다.
+
+### 9.2 Occupancy Flow Head
+
+Occupancy Flow Head는 dynamic probability와 flow / velocity를 예측한다. ViewFormer 방식을 따른다: **motion 추정은 0.6m BEV temporal stage(Section 7)에서 BEV-level flow로 하고, 출력은 0.3m sparse voxel에 매핑**한다.
+
+```text
+motion 정보 (정보의 출처):
+  Section 7의 0.6m temporal -> BEV-level flow
+  (dynamic_logit, vx, vy, [vz]) per 0.6m BEV cell
+
+출력 (다른 head와 같은 격자):
+  0.3m sparse kept voxel별로 flow 벡터를 붙인다.
+  0.6m BEV flow를 그 column의 0.3m voxel로 매핑(broadcast)하고,
+  F_0.3_sparse의 fine geometry로 per-voxel 정제(선택).
+```
+
+왜 이렇게 나누나 (ViewFormer 근거):
+
+```text
+ViewFormer는 BEV-level flow를 예측하고 each voxel cell에 map한다.
+flow의 motion granularity는 temporal을 한 해상도(0.6m)가 상한이다.
+0.3m로 출력해도 0.6m 정보를 펼친 것이며, 0.3m에서 새 motion이 생기지 않는다.
+강체(차량/보행자)는 한 BEV column이 같이 움직이므로 BEV-level로 충분.
+
+-> 출력 격자 = 0.3m (다른 head와 일치),
+   motion 해상도 = 0.6m (ViewFormer 수준, Orin 가능).
+   0.3m temporal은 하지 않는다.
+```
+
+권장 출력:
+
+```text
+O_flow:
+  [N_kept] x 5   (sparse 0.3m, kept voxel별)
+
+channels:
+  dynamic_logit
+  vx
+  vy
+  vz
+  flow_uncertainty
+```
+
+flow는 occupied voxel에서만 의미가 있으므로 프루닝된 빈 공간엔 두지 않는다. supervise도 차등 적용한다.
+
+```text
+occupied dynamic voxel:
+  velocity / flow loss 적용
+
+static occupied voxel:
+  near-zero flow regularization
+
+free / unknown voxel:
+  flow loss 약하게 또는 ignore
+```
+
+### 9.3 Sub-Voxel Shape Information Head
+
+Sub-Voxel Shape Information Head는 30cm voxel 내부의 local shape를 표현한다.
+
+Occupancy Head가 말하는 것:
+
+```text
+이 30cm voxel은 occupied / free / unknown인가?
+```
+
+Sub-Voxel Shape Information Head가 말하는 것:
+
+```text
+occupied 또는 boundary voxel 내부에서
+실제 표면이 어디를 지나가는가?
+어떤 face가 free / unknown 공간과 맞닿아 있는가?
+local surface normal은 무엇인가?
+voxel 내부가 부분적으로만 차 있는가?
+얇은 구조물인가?
+shape prediction uncertainty는 얼마인가?
+```
+
+이 head는 "보이는 면만 refine" 원칙을 내부 동작으로 갖는다.
+
+여기서 "보이는 면"의 기본 의미는 camera visibility가 아니라 **occupancy topology 기준의 exposed face**다.
+
+```text
+exposed face:
+  occupied / boundary voxel의 6-neighbor 중
+  free 또는 unknown neighbor와 맞닿은 face
+
+camera visibility:
+  query priority와 confidence를 조정하는 보조 신호
+```
+
+기본 exposed-face 계산:
+
+```text
+for each kept (occupied/boundary) voxel v:
+  for face in [+x, -x, +y, -y, +z, -z]:
+    neighbor = voxel adjacent to face
+    exposed_face[face] = (neighbor가 프루닝됨) or (neighbor가 free/unknown)
+```
+
+sparse 표현에서는 **프루닝된 neighbor가 곧 free/unknown 공간**이므로, exposed-face 판정이 자연스럽게 맞아떨어진다. 즉 살아남은 voxel의 6-neighbor 중 비어있는(프루닝된) 방향이 곧 노출된 면이다. 이 head는 `F_0.3_sparse`의 kept voxel 위에서만 동작하므로, 모든 voxel을 dense하게 도는 비용이 처음부터 없다.
+
+권장 출력:
+
+```text
+O_shape:
+  exposed_face_logits: 6 channels
+  face_surface_offset: 6 channels
+  local_normal: 3 channels
+  shape_uncertainty: 1 channel
+  thinness_logit: 1 channel
+  shape_code: Cs channels, e.g. 8 or 16
+```
+
+전체 channel 예시:
+
+```text
+Cs = 8:
+  6 + 6 + 3 + 1 + 1 + 8 = 25 channels
+
+Cs = 16:
+  33 channels
+```
+
+face_surface_offset은 각 exposed face에서 voxel 내부 surface까지의 normalized distance로 둔다.
+
+```text
+offset range:
+  [0, 1] 또는 [-0.5, 0.5]
+
+예:
+  +x face가 exposed
+  offset = 0.2
+  -> +x face에서 voxel 내부 0.2 * 0.3m 지점에 surface crossing 후보
+```
+
+local_normal은 voxel 내부 surface normal이다. 처음에는 voxel당 하나의 normal로 시작하고, 나중에 복잡한 corner / thin object가 필요하면 face별 normal로 확장한다.
+
+#### Face-aware Execution
+
+모든 occupied voxel 내부를 동일하게 촘촘히 query하지 않는다.
+
+```text
+fully free voxel:
+  Sub-Voxel Shape loss / query 없음
+
+fully occupied interior voxel:
+  exposed face 없음
+  shape query 거의 없음
+
+surface / boundary voxel:
+  exposed face가 있는 방향으로만 local shape query
+
+corner / thin object candidate:
+  여러 exposed face가 있으므로 query budget 증가
+```
+
+query budget 예시:
+
+```text
+M_i = f(
+  number_of_exposed_faces,
+  occupancy_uncertainty,
+  shape_uncertainty,
+  dynamic_score,
+  planner_relevance,
+  camera_visibility
+)
+```
+
+face 수에 따른 동작:
+
+```text
+one exposed face:
+  해당 face normal 방향으로만 offset / boundary query
+
+two exposed faces:
+  edge voxel로 보고 두 face 방향 query
+
+three or more exposed faces:
+  corner / thin object 후보
+  더 많은 local query 사용
+
+zero exposed face:
+  heavy local query 생략
+```
+
+중요한 점:
+
+```text
+Sub-Voxel Shape Information Head는 core 4 head 중 하나다.
+exposed-face mask와 query budget은 이 head의 실행 방식이다.
+별도 sparse feature path가 아니다.
+```
+
+### 9.4 3D Semantics Head
+
+3D Semantics Head는 각 30cm voxel의 semantic class를 예측한다.
+
+권장 초기 class:
+
+```text
+free / unknown은 Occupancy Head가 담당하므로 semantics에서는 제외하거나 ignore 처리
+
+semantic classes:
+  road / ground
+  vehicle
+  pedestrian
+  cyclist / two-wheeler
+  curb / barrier
+  vegetation
+  building / wall
+  other static
+```
+
+출력:
+
+```text
+O_sem:
+  [N_kept] x N_class   (sparse, kept voxel별)
+```
+
+semantic은 occupied voxel에서만 의미가 있으므로 sparse 표면 voxel 위에서 계산하는 것이 자연스럽다. semantic loss는 occupied 또는 surface-near voxel 중심으로 적용한다. free / unknown 영역에 semantic label을 강제로 주면 noisy supervision이 될 수 있다.
+
+---
+
+## 10. Queryable Occupancy Interface
+
+Queryable output은 별도 volume head가 아니다. 4개 head가 만든 sparse surface feature / shape code / semantic output과 coarse dense occupancy를 사용해 임의 좌표를 평가하는 interface다.
+
+```text
+query point x, y, z
+-> 30cm voxel index 찾기
+-> 이 voxel이 프루닝됨?
+     yes -> coarse dense occupancy를 읽어 free / unknown 즉답 (MLP 생략)
+     no  -> 아래 정밀 경로
+-> local coordinate u in voxel
+-> sample F_0.3_sparse (kept voxel)
+-> sample shape_code / shape parameters
+-> small Queryable MLP
+-> continuous occupancy / semantic / uncertainty
+```
+
+즉 빈 공간(프루닝된 영역) query는 비싼 MLP를 타지 않고 coarse dense occupancy로 바로 답한다. 정밀 MLP는 occupied 표면 근처 query에만 실행된다.
+
+입력:
+
+```text
+F_query:
+  trilinear_sample(F_0.3_sparse, x)   # kept voxel 주변에서만 유효
+
+shape_context:
+  shape_code
+  exposed_face_mask
+  face_surface_offset
+  local_normal
+  shape_uncertainty
+
+local coordinate:
+  u in [-0.5, 0.5]^3
+```
+
+출력:
+
+```text
+p_occupied(x)
+p_unknown(x)
+optional semantic(x)
+optional signed distance / boundary probability
+```
+
+이 interface는 dense 5cm 또는 10cm grid를 만드는 것이 아니다. planner나 collision checker가 필요한 좌표만 물어보는 query path다.
+
+packed execution:
+
+```text
+selected query points:
+  Q x 3
+
+MLP input:
+  Q x D
+
+MLP output:
+  Q x output_dim
+```
+
+나쁜 방식:
+
+```text
+for voxel in selected_voxels:
+  QueryableMLP(voxel_queries)
+```
+
+권장 방식:
+
+```text
+모든 local query point를 Q x D로 pack
+QueryableMLP를 한 번 또는 큰 batch 몇 번으로 실행
+```
+
+---
+
+## 11. Surface Outputs Head (Tesla-style 별도 브랜치)
+
+Tesla AI Day 2022 그림에서 Surface Outputs는 Volume Outputs와 **나란한 별도 출력 브랜치**다(Queryable Outputs와도 분리). 본 문서도 이를 따라, road surface geometry를 4개 volume head의 readout 후처리가 아니라 **독립 head**로 둔다.
+
+```text
+Tesla 그림의 출력 그룹:
+  Volume Outputs   = 4 volume heads (Occupancy/Flow/Sub-Voxel Shape/Semantics)
+  Surface Outputs  = 별도 브랜치  <- 이 Section
+  Queryable Outputs = MLP 인터페이스 (Section 10)
+```
+
+### 11.1 입력과 출력
+
+Surface는 노면 높이장(z_surface)으로, BEV column마다 하나의 매끄러운 값이다. 따라서 sparse 표면 voxel이 아니라 **0.6m dense feature를 입력으로 받는 dense BEV head**로 두는 것이 자연스럽다(RoadBEV식 BEV elevation regression).
 
 ```text
 input:
-  quota-based Top-K가 선택한 voxel index
-  K_total hard cap (2048 권장)
+  F_0.6_temporal (dense, 100 x 34 x 10)
+  -> ZPool / BEV projection -> 100 x 34 x C_bev
+  (보조 입력) coarse occupancy, 3D semantics의 ground/road 채널
 
-per-Gaussian parameters:
-  mean:     voxel center + learnable offset
-  scale:    0.2m 근방 isotropic 초기화
-  rotation: identity quaternion
-  opacity:  base occupancy logit에서 초기화
-  feature:  0.4m feature trilinear sample
+output (dense BEV, 0.6m 격자 또는 0.3m로 upsample):
+  z_surface        : 노면 높이
+  valid            : 유효/관측 여부
+  uncertainty      : 높이 불확실도
+  slope / normal   : 경사
+  step_height      : 연석 / 계단 높이
 ```
 
-### Deformable Image Re-query
+### 11.2 다른 head와의 관계
 
-각 Gaussian이 자기 위치를 canonical virtual camera에 재투영해 image feature를 다시 읽고 파라미터를 갱신한다. 이 단계가 이 branch의 존재 이유다. 1.6m lifting 이후 처음으로 이미지의 새 정보가 선택 영역에 유입된다.
+별도 head지만, 정밀 geometry는 volume head 출력을 보조로 쓴다.
 
 ```text
-Gaussian mean (+ scale 방향 offset points)
--> canonical virtual camera로 projection
--> P3 feature level에서 deformable sampling
--> sampled image feature + Gaussian feature
--> small MLP
--> 파라미터 잔차 갱신:
-   mean offset / scale / rotation / opacity / feature
+Occupancy Head:        riser / vertical face / obstacle boundary
+Sub-Voxel Shape Head:  exposed face, local normal, offset (z_surface sub-voxel 정밀화)
+3D Semantics Head:     road / curb / barrier / stair-like class
+
+Surface Outputs Head:  위를 종합해 z_surface, slope, step, uncertainty를 직접 예측
+```
+
+핵심: z_surface의 수직 정밀도는 0.3m 격자에 갇히지 않도록, Sub-Voxel Shape Head의 surface offset을 반영한다(단순 occupancy boundary만으로 유도하지 않는다).
+
+### 11.3 학습
+
+```text
+GT:
+  Section 19의 ground/road segmentation + 연속 표면(SDF/mesh)에서
+  per-BEV-cell z_surface / slope / step / valid 라벨 생성
+
+loss:
+  z_surface regression (valid mask),
+  uncertainty는 heteroscedastic 또는 ensemble로 학습
+```
+
+v1에서도 Tesla처럼 별도 head로 두되, 모듈은 가볍게(BEV conv 몇 layer) 시작한다.
+
+---
+
+## 12. Runtime Masking and Multi-rate Scheduling
+
+Active mask는 이제 별도 prediction head가 아니다. Sub-Voxel Shape Head와 Queryable Interface를 어디에 얼마나 비싸게 실행할지 정하는 runtime priority map이다.
+
+priority score:
+
+```text
+S_query =
+    exposed_face_score
+  + occupancy_uncertainty
+  + shape_uncertainty
+  + dynamic_score
+  + planner_relevance
+  + visibility_frontier_score
+```
+
+사용처:
+
+```text
+1. Sub-Voxel Shape Head의 expensive local query 위치 선택
+2. Queryable MLP의 point budget 배분
+3. planner corridor / near-field collision region 강화
+4. dynamic object boundary 보강
+```
+
+20 FPS v1에서는 모든 voxel에 heavy query를 수행하지 않는다.
+
+```text
+매 frame dense 실행:
+  F_0.3 trunk
+  Occupancy Head
+  Occupancy Flow Head
+  cheap Sub-Voxel Shape parameters
+  3D Semantics Head
+
+masked / budgeted 실행:
+  local sub-voxel query
+  queryable MLP
+  planner-triggered high-detail readout
 ```
 
 권장 budget:
 
 ```text
-rounds:
-  1 round로 시작, 최대 2 rounds
+K_surface_voxels:
+  2048 ~ 8192 selected voxels
 
-sampling points:
-  Gaussian당 4~8 points
+Q_total:
+  16k ~ 64k local query points
 
-feature level:
-  P3 중심, P2 추가는 v1.5 이후
-```
-
-주의:
-
-```text
-projection 대상은 canonical virtual camera다.
-virtual camera는 하드웨어와 무관한 설계 상수이므로,
-raw calibration에 의존하지 않는다는
-calibration-light 원칙은 유지된다.
-```
-
-이 re-query는 이전 초안에서 v1.5로 미뤘던 `P2/P3 local image re-query`를 budget-bounded 형태로 기본 경로에 편입한 것이다. Orin latency 측정 결과 부담이 크면 re-query round를 0으로 두는 fallback(0.4m feature 기반 refine만)으로 내릴 수 있다.
-
-### Query Budget
-
-refinement 영역마다 queryable evaluation point 수 `M_i`는 다르게 둔다.
-
-```text
-M_i = f(
-  uncertainty_score,
-  boundary_score,
-  planner_relevance,
-  dynamic_score,
-  visibility_score
-)
-```
-
-거리/플래너 LOD도 `M_i`에 반영한다.
-
-```text
-near + planner path + dynamic:
-  larger M_i
-
-far + static + low uncertainty:
-  smaller M_i
-
-certain free / occupied interior:
-  M_i = 0
-```
-
-### Derived Properties
-
-```text
-surface normal:
-  covariance의 최소 고유값 방향에서 analytic하게 유도
-  road surface geometry head의 derived normal과 cross-check 가능
-
-thin object:
-  anisotropic scale이 20cm grid보다 얇은 구조를 직접 표현
-
-boundary:
-  기존 probe -> sign crossing -> refine의 순차 boundary search 불필요
-  Gaussian 파라미터 자체가 boundary 위치/방향을 표현
-
-dynamic object:
-  flow head와 결합해 Gaussian velocity로 확장 가능 (v2)
-```
-
-기존 exposed-face mask는 핵심 메커니즘에서 제외한다. 필요하면 Section 11의 query point 배치 prior로만 사용한다.
-
-### Supervision
-
-```text
-voxel GT만 있는 경우:
-  superposition 평가 결과를 20cm voxel GT로 supervise
-  sub-voxel 신호는 없음 (GT 해상도의 한계)
-
-연속 GT가 있는 경우:
-  aggregated LiDAR / mesh / simulation 또는
-  Section 19 pipeline의 연속 SDF에서 만든
-  continuous point GT로 직접 supervise
-
-옵션:
-  Gaussian rendering 기반 self-supervision
-  (GaussTR / GaussianOcc 계열)
-  voxel GT 없이 이미지에서 sub-voxel 신호를 얻는 경로
+start:
+  K = 4096
+  average M_i = 4~8
 ```
 
 ---
 
-## 11. Probabilistic Queryable Evaluation
-
-이 branch는 optional debugging idea가 아니라, 이 문서의 목표 구조에서는 기본 경로에 포함한다.
-
-먼저 기본 20cm dense occupancy는 0.4m feature에서 structured sub-voxel channel head로 만든다 (Section 9).
-
-```text
-0.4m dense feature
--> structured sub-voxel channel head
--> 300 x 100 x 25 dense occupancy
-```
-
-이 결과는 전체 map의 base output이다. 하지만 이 출력은 fixed 20cm grid의 결과다. Tesla-style로 임의 좌표나 voxel 내부를 더 깊게 query하려면 선택된 영역의 연속 표현이 필요하고, 그 연속 표현이 Section 10의 refinement Gaussian이다.
-
-임의의 query point는 주변 refinement Gaussian의 probabilistic superposition으로 평가한다 (GaussianFormer-2 방식).
-
-```text
-query point x
--> selected voxel grid 기반 local neighbor lookup
--> 주변 refinement Gaussian 탐색
--> 각 Gaussian의 occupancy 확률 기여를 superposition
--> p(occupied | x), local boundary, surface normal
-```
-
-packed execution:
-
-```text
-selected region count:
-  K (refinement Gaussian budget과 동일)
-
-query count per region:
-  M_i (distance / planner-aware LOD budget으로 결정)
-
-total query count:
-  Q = sum_i M_i
-
-packed tensors:
-  p_query_packed: Q x 3
-  query_offsets:  K + 1
-  neighbor_index: query당 상위 N개 Gaussian index
-
-실행 규칙:
-  모든 query point를 Q x 3 batch로 펴서
-  superposition을 한 번의 batched 연산으로 평가
-  region별 loop 금지
-```
-
-평가가 MLP가 아니라 analytic mixture이므로, 기존 Queryable MLP 방식 대비 추가 학습 파라미터 없이 query 수를 늘릴 수 있다. 필요하면 superposition 출력 위에 아주 작은 MLP를 둬서 semantic / dynamic 보정만 한다.
-
-역할 분담:
-
-```text
-0.4m dense feature:
-  전체 공간의 coarse context
-
-20cm dense occupancy:
-  전체 map의 기본 occupied/free/unknown 결과 (structured head)
-
-refinement Gaussians:
-  선택된 어려운 영역의 연속 local 표현
-
-probabilistic evaluation:
-  임의 좌표의 continuous occupancy / boundary / normal
-```
-
-이 branch가 특히 필요한 경우:
-
-```text
-얇은 물체
-boundary / surface-shell
-dynamic object 주변
-occlusion / visibility frontier
-planner path 주변
-한쪽 면만 노출된 voxel 내부 carving
-```
-
-최종 표현:
-
-```text
-base voxel:
-  fixed 20cm grid cell
-
-surface-shell overlay:
-  Gaussian superposition에서 유도한
-  adaptive partial cuboid / local surface patch
-```
-
-전체 grid는 여전히 20cm fixed voxel grid다. 가변적인 것은 selected 영역의 연속 local 표현이다.
-
----
-
-## 12. Active Mask Design
-
-active mask는 최종 occupancy를 계산할 때 쓰는 마스크가 아니다. 전체 20cm occupancy는 기본 경로에서 이미 계산한다.
-
-```text
-0.4m dense feature
--> structured sub-voxel channel head
--> dense occupancy
-```
-
-active mask의 역할은 다음 두 가지다.
-
-```text
-1. budget-K refinement Gaussian을 초기화할 voxel 선택
-2. probabilistic queryable evaluation을 집중할 surface-shell / dynamic / uncertain 영역 선택
-```
-
-즉 active mask는 "이 voxel이 occupied인가?"를 결정하는 마스크가 아니라, "이 영역을 더 깊게 볼 것인가?"를 결정하는 refinement selection mask다.
-
-정확히는 binary mask만 출력하는 것이 아니라, 각 voxel 또는 cell의 refinement priority score를 만든다.
-
-```text
-S_refine =
-    boundary_score
-  + uncertainty_score
-  + dynamic_score
-  + planner_relevance
-  + surface_score
-  + visibility_frontier_score
-  + near_field_score
-```
-
-이 score는 바로 dense refinement를 실행한다는 뜻이 아니다. 다음 quota-based Top-K scheduler가 고정된 개수의 voxel만 선택한다.
-
-단순히 occupied probability가 높은 voxel만 남기면 위험하다.
-
-나쁜 pruning:
-
-```text
-keep = sigmoid(occ_logit) > threshold
-```
-
-이렇게 하면 camera-only 환경에서 가려진 물체, 얇은 물체, 멀리 있는 물체를 너무 빨리 버릴 수 있다.
-
-더 안전한 active mask:
-
-```text
-keep =
-    occupied 가능성 높은 voxel
-  + uncertainty 높은 voxel
-  + boundary 근처 voxel
-  + ego path / planned trajectory 주변 voxel
-  + dynamic object 주변 voxel
-  + 일부 random negative voxel
-```
-
-특히 `uncertain voxel`을 keep하는 것이 중요하다.
-
-```text
-free != unknown
-```
-
-자율주행 occupancy에서는 비어 있음과 모름을 구분해야 한다.
-
-### Quota-based Top-K Refinement Scheduler
-
-실시간성을 위해 매 frame refinement 대상 수를 고정한다.
-
-```text
-S_refine
--> category별 candidate 분리
--> quota-based Top-K
--> selected voxel index K개
-```
-
-단순 Top-K만 쓰면 score가 큰 한 종류의 영역에 예산이 몰릴 수 있다. 예를 들어 큰 벽의 boundary가 대부분을 차지하면, 작은 동적 물체나 planner path 주변 장애물이 선택되지 않을 수 있다.
-
-따라서 category별 quota를 둔다.
-
-```text
-K_total = fixed runtime budget
-
-K_boundary
-K_near
-K_planner
-K_dynamic
-K_uncertain
-K_visibility_frontier
-K_random_probe
-```
-
-20 FPS v1 권장 예시:
-
-```text
-K_total = 2048
-
-K_boundary            = 768
-K_near                = 384
-K_planner             = 384
-K_dynamic             = 256
-K_uncertain           = 192
-K_random_probe        = 64
-```
-
-`K_total`은 latency와 품질을 직접 조절하는 knob이다.
-
-```text
-K = 1024:
-  빠름, refinement 적음
-
-K = 2048:
-  20 FPS v1 권장 시작점
-
-K = 4096:
-  품질은 좋지만 20 FPS hard target에서는 부담 증가
-```
-
-### Distance / Planner-aware LOD Budget
-
-여기서 LOD는 octree처럼 voxel grid를 재귀적으로 쪼개는 뜻이 아니다. 기본 20cm grid는 유지하고, adaptive query budget만 거리와 중요도에 따라 다르게 주는 뜻이다.
-
-권장 정책:
-
-```text
-near field, 0~10m:
-  높은 refinement budget
-  planner path / dynamic / boundary 우선
-
-mid field, 10~25m:
-  중간 refinement budget
-  boundary / dynamic / uncertainty 중심
-
-far field, 25~50m:
-  낮은 refinement budget
-  큰 obstacle boundary와 high-uncertainty만 선택
-```
-
-planner가 현재 평가 중인 trajectory corridor는 거리와 무관하게 quota를 별도로 둔다.
-
-```text
-planned trajectory 주변:
-  near / mid / far와 별도로 planner quota로 보장
-
-확실한 free space:
-  refinement 제외
-
-확실한 occupied interior:
-  refinement 제외
-
-unknown / visibility frontier:
-  일부 quota 유지
-```
-
-추천 output heads:
-
-```text
-occupancy probability
-free probability
-unknown / visibility probability
-dynamic probability
-flow / velocity
-surface-related priority score
-```
-
----
-
-## 13. 20 FPS Runtime Target and Multi-rate Scheduling
+## 13. 20 FPS Runtime Target
 
 Jetson AGX Orin 기준 v1 hard target은 20 FPS다.
 
@@ -1413,113 +1366,71 @@ latency target:
   p95 <= 55~60ms
 ```
 
-20 FPS를 목표로 하면 모든 고비용 출력을 모든 frame에서 같은 강도로 실행하지 않는다. 대신 perception의 기본 출력은 매 frame 유지하고, 무거운 refinement는 작은 budget 또는 낮은 주기로 실행한다.
-
-핵심 개념:
+20 FPS implementation guardrails:
 
 ```text
-매 frame 반드시 나와야 하는 것:
-  base occupancy
-  road surface geometry
-  active mask
-  small refinement
+Spatial lifting:
+  1.2m vanilla cross-attention
+  0.6m or 0.3m image cross-attention 금지
 
-매 frame 전부 무겁게 하지 않아도 되는 것:
-  large adaptive refinement
-  dense flow refinement
-  optional semantic / traversability extension
+Temporal:
+  단일 stage @ 0.6m BEV (ViewFormer-style), 경량 gated conv
+  1.2m 별도 temporal stage 두지 않음
+  full 3D temporal memory 금지
+  0.6m/0.3m full global temporal attention 금지
+  0.3m temporal 금지
+
+Feature:
+  1.2m -> 0.6m는 dense (temporal/coarse occupancy가 여기).
+  coarse dense occupancy/visibility는 0.6m에서 dense.
+  0.6m -> 0.3m만 sparse deconv + 프루닝.
+  30cm dense volume feature는 만들지 않는다.
+  C는 48 or 64로 시작한다.
+
+Prune:
+  0.6m -> 0.3m keep ratio는 PanoOcc(0.2)보다 보수적으로 (0.5, recall 우선).
+  far-field는 더 높여 원거리 물체 보호.
+
+Volume heads:
+  1x1x1 (sparse) conv / light MLP 중심
+  head 내부 large attention 금지
+
+Sub-voxel shape:
+  sparse 표면 voxel 위에서만 동작
+  expensive local query는 exposed face / priority mask로 추가 제한
+
+Precision / deployment:
+  TensorRT FP16을 기본 목표
+  단 sparse 3D conv(spconv/torchsparse)는 TensorRT 네이티브 지원이 약함.
+  Orin 커스텀 커널/플러그인 필요, FP16 최적화 난이도 증가.
+  sparse 배포가 막히면 fallback:
+    coarse dense + 0.3m는 ROI/frustum crop된 masked dense로 근사.
+  INT8은 v1.5 이후 검토
 ```
 
-권장 multi-rate schedule:
+multi-rate schedule:
 
 ```text
 20 FPS, every frame:
   image backbone
-  1.6m spatial attention
-  temporal BEV memory update
-  dense deconv to 0.4m
-  20cm base occupancy
-  road surface geometry
-  active mask
-  small K refinement
+  1.2m spatial attention
+  dense deconv 1.2m -> 0.6m
+  ViewFormer-style temporal @ 0.6m (경량 conv)
+  coarse dense occupancy / visibility @ 0.6m
+  sparse deconv + prune 0.6m -> 0.3m
+  4 volume heads (sparse) + Surface Outputs head
+  small masked sub-voxel query
 
 10 FPS, every 2 frames:
-  heavier adaptive refinement
-  larger Q_total query budget
-  flow refinement for wider active regions
+  larger queryable MLP budget
+  wider dynamic boundary readout
+  longer temporal history (N 증가)
 
-planner-triggered, as needed:
-  planned trajectory corridor refinement
-  near-field collision check refinement
-  dynamic object boundary refinement
+planner-triggered:
+  trajectory corridor fine query
+  near-field collision detail
+  uncertain exposed-face region
 ```
-
-즉 시스템은 매 frame 20 FPS로 기본 occupancy를 내보낸다. 하지만 고비용 query refinement는 모든 영역에서 매 frame full budget으로 돌리지 않고, 중요 영역 또는 저주기 branch로 나눠서 실행한다.
-
-20 FPS v1 default budget:
-
-```text
-K_total:
-  1024 ~ 2048 refinement Gaussians
-
-re-query budget:
-  Gaussian당 4~8 deformable sampling points, 1 round
-
-Q_total:
-  8k ~ 32k queryable evaluation points
-
-recommended start:
-  K_total = 2048
-  re-query points = 8, 1 round
-  average M_i = 8
-  Q_total ~= 16k
-```
-
-20 FPS implementation guardrails:
-
-```text
-Base dense occupancy:
-  structured sub-voxel channel head 사용
-  모든 20cm voxel에 generic GridSample + MLP를 호출하지 않음
-
-Gaussian refinement:
-  active mask가 선택한 K개 voxel에서만 초기화
-  이미지 기반 Gaussian 초기화 모듈 금지
-  deformable re-query는 1~2 round, P3 중심으로 제한
-  full-scene Gaussian-to-voxel splatting 금지
-  K_total / Q_total hard cap 유지
-  packed batched evaluation 필수
-
-Dense features:
-  0.4m까지만 dense feature 유지
-  0.2m dense feature volume 금지
-
-Temporal:
-  0.8m BEV memory만 저장 (시간 간격 keyframe)
-  full 3D temporal memory 금지
-
-Precision / deployment:
-  TensorRT FP16을 기본 목표로 둠
-  backbone / MLP INT8은 v1.5 이후 선택적으로 검토
-
-Runtime profiling:
-  PyTorch eager mode 성능으로 20 FPS를 기대하지 않음
-  p50 / p95 latency와 peak GPU memory를 매 stage별 측정
-```
-
-20 FPS v1에서 제외하는 것:
-
-```text
-dense 0.2m feature volume
-full 3D temporal memory
-unbounded dense P2/P3 local image re-query
-full-scene Gaussian splatting / 이미지 기반 Gaussian 초기화 모듈
-all-camera high-resolution local attention
-all-voxel generic GridSample + MLP dense query
-large K_total such as 4096 by default
-```
-
-local image re-query는 무제한 dense 형태로는 제외한다. 대신 budget-K Gaussian branch의 deformable re-query가 `K hard cap / 1~2 round / P3 중심` 제한 안에서 같은 역할을 한다. Orin 측정 결과 이 비용도 부담이면 re-query round를 0으로 내리는 fallback(0.4m feature 기반 refine만)을 쓴다.
 
 ---
 
@@ -1532,103 +1443,98 @@ local image re-query는 무제한 dense 형태로는 제외한다. 대신 budget
 2. Canonical-view preprocessing
 3. Image backbone + neck
 4. Canonical ray positional embedding
-5. Vanilla spatial attention at 1.6m
-6. ViewFormer-style temporal BEV memory alignment
-7. Temporal context injection into 1.6m 3D feature
-8. Dense deconv: 1.6m -> 0.8m
-9. Dense deconv: 0.8m -> 0.4m
-10. Produce road surface geometry: z_surface / valid / uncertainty
-11. Produce 300 x 100 x 25 dense occupancy with structured sub-voxel channel head
-12. Produce dynamic probability / occupancy flow
-13. Build active mask from occupancy / uncertainty / boundary / flow / surface / planner scores
-14. Quota-based Top-K scheduler with fixed K budget
-15. Distance / planner-aware LOD query budget assignment
-16. Initialize budget-K refinement Gaussians at selected voxels
-17. Deformable image re-query refines Gaussian parameters
-18. Packed batched probabilistic queryable evaluation
+5. Vanilla spatial attention at 1.2m (3D voxel query)
+6. Dense deconv: 1.2m -> 0.6m
+7. 0.6m pre-temporal feature refinement
+8. ViewFormer-style single BEV temporal @ 0.6m (z-squeeze, streaming, 경량 conv, BEV flow)
+9. Unsqueeze / inject -> F_0.6_temporal
+10. Coarse dense occupancy / visibility head @ 0.6m (free/unknown, 프루닝 guide)
+11. Sparse deconv + prune: 0.6m -> 0.3m
+12. Produce F_0.3 sparse surface feature (kept voxels)
+13. Occupancy Head (sparse fine 표면 갈래)
+14. Occupancy Flow Head (0.3m sparse 출력, motion은 step 8에서)
+15. Sub-Voxel Shape Information Head (sparse)
+16. 3D Semantics Head (sparse)
+17. Surface Outputs head (별도 브랜치, dense BEV)
+18. Build exposed-face / priority mask
+19. Packed queryable MLP for selected local points (pruned 영역은 coarse로 즉답)
+20. Planner readout
 ```
 
 최종 구조를 한 줄로 정리하면:
 
 ```text
-Canonical-view REO-style attention
-+ ViewFormer-style streaming temporal BEV memory
-+ PanoOcc-style 2-stage coarse-to-fine deconv
-+ RoadBEV/FastRSR-style road surface geometry head
-+ structured sub-voxel 20cm dense occupancy head
-+ dynamic / flow head
-+ quota-based Top-K refinement scheduler
-+ distance / planner-aware LOD budget
-+ GaussianFormer-style budget-K refinement Gaussians
-+ deformable image re-query on canonical virtual cameras
-+ GaussianFormer-2-style packed probabilistic queryable evaluation
+1.2m에서 이미지를 3D로 들어올리고,
+0.6m에서 ViewFormer-style 시간 정렬 + flow + coarse dense free/unknown을 만들고,
+sparse deconv + 프루닝으로 occupied 표면만 0.3m까지 올린 뒤,
+Tesla-style 4개 volume head + Surface Outputs head를 붙인다.
 ```
 
 ---
 
 ## 15. Why This Architecture
 
-`0.8m attention + 1 deconv`보다 `1.6m attention + 2 deconv`가 Jetson AGX Orin 추론에서 더 유리할 가능성이 있다.
+### 1.2m Spatial Attention
 
-이유:
-
-```text
-0.8m query count ~= 13,125
-1.6m query count ~=  1,976
-```
-
-attention query 수가 약 6배 이상 줄어든다.
-
-추가되는 deconv는 다음 단계다.
+0.6m image cross-attention보다 1.2m image cross-attention이 훨씬 싸다.
 
 ```text
-1.6m -> 0.8m
+1.2m queries:
+  4,250
+
+0.6m queries:
+  34,000
 ```
 
-이 단계의 output voxel 수는 약 13k라서 상대적으로 작다. 반면 둘 다 공통으로 필요한 무거운 deconv는 다음 단계다.
+attention 비용은 query 수, image token 수, memory movement에 민감하므로 embedded GPU에서는 coarse spatial lifting이 유리하다.
+
+### Temporal at 0.6m, Before Final Deconvolution (ViewFormer-style)
+
+Tesla 그림은 temporal alignment가 최종 deconvolution 이후 고해상도 feature가 아니라, 그 이전 coarse latent에 붙는 흐름으로 읽힌다. 본 문서는 그 coarse latent를 **0.6m 단일 stage**로 둔다.
 
 ```text
-0.8m -> 0.4m
+0.3m에서 temporal:
+  cell 13,600개 -> Orin 위협, 금지
+
+1.2m에서 temporal:
+  Tesla coarsest 원칙엔 맞지만 ViewFormer(~0.8m)보다 거칢
+  flow motion이 30cm 4x4에 평균화됨 -> 과보수적
+
+0.6m에서 temporal (채택):
+  ViewFormer voxel query ~0.8m에 근접 -> flow 적합
+  Z=10층 유지(붕괴 없음), 여전히 최종 deconv 이전 latent
+  cell 3,400개 + 경량 conv -> Orin 가능
 ```
 
-따라서 전체적으로는 다음 trade-off가 된다.
+ViewFormer 근거: voxel query를 z-squeeze해 BEV에서 streaming temporal을 하고 다시 voxel로 unsqueeze해 occupancy/flow를 낸다. 이 BEV-to-BEV temporal이 voxel-to-voxel보다 효율적이고 성능도 좋았다고 보고된다. 단, raw deconv feature는 날것일 수 있으므로 temporal 직전 0.6m pre-temporal refinement를 둔다(BEVDet4D 교훈).
+
+### 30cm Sparse Surface Feature + Coarse Dense Occupancy
+
+final feature를 전부 coarse하게 유지하면 Tesla식 4 volume head와 거리가 생기고, 반대로 0.3m를 완전 dense로 만들면 272,000 voxel 3D deconv가 Orin 20Hz를 위협한다. 그래서 둘로 나눈다.
 
 ```text
-attention 비용: 크게 감소
-deconv 비용: 작게 증가
+free / unknown (빈 공간, 저주파):
+  coarse dense @ 0.6m
+
+occupied surface (물체 경계, 고주파):
+  sparse deconv + prune @ 0.3m
+  -> F_0.3_sparse
+  -> 4 volume heads
 ```
 
-Jetson AGX Orin처럼 embedded GPU에서 attention, sampling, softmax, memory movement가 병목이 될 수 있기 때문에 이 trade-off가 유리할 수 있다.
+이 분리는 Tesla 데모(표면에만 voxel 존재 = surface-centric)와 맞고, dense 0.3m 비용을 피하면서 4 volume head를 그대로 유지한다. 빈 공간은 정밀도가 필요 없고, 정밀도가 필요한 표면만 30cm로 푼다.
 
-temporal module도 같은 이유로 3D memory가 아니라 BEV memory를 사용한다. 단 저장/warp 해상도는 1.6m이 아니라 0.8m이다. 1.6m cell은 frame당 ego 이동(~0.5m)의 sub-cell warp가 보간으로 번져 기억이 흐려지기 때문이다.
+### Sub-Voxel Shape as a Head
+
+Sub-Voxel Shape Information은 성능 개선용 후처리가 아니다. Occupancy, Flow, Semantics와 같은 level의 volume output이다.
+
+다만 그 내부에서:
 
 ```text
-1.6m 3D feature:
-38 x 13 x 4 x C
-
-0.8m BEV memory:
-75 x 25 x Cb
-(4 keyframes, C=64 fp16 기준 약 1MB)
+모든 voxel을 같은 비용으로 자세히 보지 않고,
+exposed face / uncertainty / planner relevance에 따라
+local query budget을 다르게 배분한다.
 ```
-
-여러 프레임을 저장할 때 z축이 빠지는 것만으로 memory와 temporal attention 비용이 크게 줄어든다. 이후 temporal context는 현재 3D feature에 다시 주입하므로, 과거 정보는 싸게 쓰고 현재 frame의 height 구조는 유지할 수 있다.
-
-refinement branch가 sparse feature anchor + Queryable MLP가 아니라 budget-K Gaussian인 이유도 같은 비용 논리다.
-
-```text
-sparse anchor + Queryable MLP:
-  0.4m feature를 다시 보간하는 구조
-  1.6m lifting 이후 이미지의 새 정보가 유입되지 않음
-  boundary 정밀도가 0.4m feature의 정보량에 갇힘
-
-budget-K Gaussian refinement:
-  같은 K budget으로 deformable image re-query 1 round 추가
-  선택 영역만 이미지에서 새 정보를 받아옴
-  covariance가 normal / thin structure를 analytic하게 표현
-  임의 좌표 평가가 추가 파라미터 없는 closed-form superposition
-```
-
-GaussianFormer 계열을 전면 채택하지 않는 이유도 명확하다. 원본 구조는 desktop GPU에서도 수백 ms급이고, 커스텀 splatting CUDA op과 이미지 기반 초기화 모듈은 TensorRT/Jetson 배포에 불리하다. 이 문서는 그 중 비용 대비 효과가 확실한 세 가지(파라미터화, deformable re-query, superposition 평가)만 budget-bounded로 가져온다.
 
 ---
 
@@ -1639,50 +1545,48 @@ GaussianFormer 계열을 전면 채택하지 않는 이유도 명확하다. 원�
 ```text
 Stage 1:
   canonical-view preprocessing
-  + 1.6m spatial attention
-  + 2-stage dense deconv to 0.4m
-  + 20cm structured occupancy head
-  + basic road surface geometry head
+  + 1.2m spatial attention
+  + dense deconv 1.2m -> 0.6m
+  + coarse dense occupancy / visibility head @ 0.6m (free/unknown)
+  + 0.6m -> 0.3m decoder
+    (학습 초기엔 dense로 프로토타입,
+     occupancy supervision이 안정되면 sparse deconv + prune으로 전환)
+  + Occupancy Head (표면 갈래)
+  + 3D Semantics Head의 최소 class
   + auxiliary depth head (training-only)
 
 Stage 2:
-  ViewFormer-style 0.8m temporal BEV memory 추가 (시간 간격 keyframe)
-  ego-motion alignment / BEV warp 추가
-  dynamic / flow head 추가
+  0.6m pre-temporal refinement 추가
+  ViewFormer-style single BEV temporal @ 0.6m 추가
+  z-squeeze / streaming memory(N=3) / ego-motion warp / unsqueeze
 
 Stage 3:
-  unknown / uncertainty head 추가
-  active mask 생성
-  quota-based Top-K refinement scheduler 추가
-  distance / planner-aware LOD budget 추가
+  Occupancy Flow Head 추가 (0.6m BEV-level flow -> 0.3m 매핑)
+  dynamic probability / flow supervision 추가
 
 Stage 4:
-  budget-K Gaussian refinement branch 추가 (re-query 없이)
-  selected voxel에서 Gaussian 초기화
-  packed batched probabilistic evaluation 적용
+  Sub-Voxel Shape Information Head 추가
+  exposed_face_mask / local offset / normal / uncertainty 학습
 
 Stage 5:
-  deformable image re-query 추가 (1 round, P3)
-  Gaussian 파라미터 잔차 갱신 학습
+  packed Queryable MLP 추가
+  exposed-face / planner-aware query budget 추가
 
 Stage 6:
-  optional surface semantics / traversability 확장
+  Surface Outputs head 추가 (z_surface / slope / step / uncertainty)
 ```
-
-구현 순서 참고: Stage 4~5는 packed Queryable MLP 기반 refinement를 같은 인터페이스(selected voxel -> 파라미터/컨텍스트 -> 임의 점 평가)의 중간 baseline으로 먼저 만들어도 된다. plan.md의 Phase 08이 이 baseline에 해당하며, Gaussian branch는 인터페이스를 유지한 채 구현체만 교체한다.
 
 v1에서 명시적으로 제외:
 
 ```text
-unbounded dense P2/P3 local image re-query
-full-scene Gaussian splatting / 이미지 기반 Gaussian 초기화 모듈
-flow-aware dynamic feature correction
-dense 0.2m deconvolution
-20cm full dense feature volume
-all-voxel generic GridSample + MLP dense query
+0.6m or 0.3m image cross-attention
+0.3m full global temporal attention
+full 3D temporal memory
+30cm dense volume feature (sparse deconv + prune으로 대체)
+all-voxel dense local sub-point query
+large shape decoder per voxel
+high-resolution local image re-query
 ```
-
-local image re-query는 budget-K Gaussian branch의 deformable re-query(1~2 round, P3 중심, K hard cap)로만 허용한다. 무제한 dense 형태는 v2 이후에도 기본 경로에 넣지 않는다.
 
 training augmentation:
 
@@ -1696,8 +1600,6 @@ temporal frame dropout
 history memory dropout
 ego-motion pose noise
 ```
-
-이 augmentation은 canonical-view preprocessing에 overfit되는 것을 줄이고, 하드웨어 변경 유연성을 높이기 위해 필요하다.
 
 ---
 
@@ -1714,69 +1616,68 @@ Image encoder:
   canonical ray positional embedding
 
 Spatial lifting:
-  1.6m 3D voxel queries
+  1.2m 3D voxel queries
   vanilla cross-attention with image tokens
 
-Temporal module:
-  z-squeeze 1.6m 3D feature to BEV
-  upsample to 0.8m BEV for storage / warp
-  streaming BEV memory queue (time-spaced keyframes, ~0.2s)
-  ego-motion alignment at 0.8m
-  temporal attention
-  inject temporal BEV context back into 1.6m 3D feature
+Dense deconv:
+  1.2m -> 0.6m (dense)
 
-Dense decoder:
-  deconv 1: 1.6m -> 0.8m
-  deconv 2: 0.8m -> 0.4m
+Pre-temporal refinement @ 0.6m:
+  light 3D/BEV feature cleanup (BEVDet4D 교훈)
 
-Surface output:
-  learned z-pooling / surface query pooling from 0.4m feature
-  road surface geometry: z_surface / valid / uncertainty
-  derived geometry: slope / normal / step from z_surface
+Temporal module (ViewFormer-style, single stage @ 0.6m):
+  z-squeeze 0.6m 3D feature to BEV
+  streaming BEV memory queue (N=3~4)
+  ego-motion alignment at 0.6m
+  경량 gated temporal fusion (full attention 금지)
+  BEV-level occupancy flow
+  unsqueeze / inject temporal BEV context back into 0.6m 3D feature
 
-Volume occupancy output:
-  structured sub-voxel channel head from 0.4m feature
-  each 0.4m cell predicts 2 x 2 x 2 occupancy logits
-  reshape / crop to 300 x 100 x 25
-  occupancy / free / unknown output
+Coarse dense occupancy:
+  occupied / free / unknown / visibility @ 0.6m
+  (free/unknown 담당 + 프루닝 guide)
 
-Dynamic / flow output:
-  dynamic probability
-  occupancy flow / velocity
-  apply densely or on active voxels depending on compute budget
+Sparse decoder:
+  sparse deconv + prune: 0.6m -> 0.3m (keep 0.5, recall 우선)
 
-Runtime refinement scheduler:
-  active mask produces S_refine
-  quota-based Top-K selects fixed K voxels per frame
-  quotas: boundary / near / planner / dynamic / uncertain / visibility frontier / random probe
-  distance and planner-aware LOD assigns query budget M_i
+Final feature:
+  F_0.3_sparse surface feature (kept occupied/boundary voxels)
 
-Gaussian refinement branch:
-  initialize K Gaussians at active-mask-selected voxels
-  mean / scale / rotation / opacity / feature parameters
-  deformable image re-query on canonical virtual cameras
-  1~2 rounds, P3-level, K_total hard cap
-  residual parameter update
+Volume heads (= Tesla Volume Outputs):
+  Occupancy Head (coarse dense free/unknown + sparse fine 표면)
+  Occupancy Flow Head (0.3m sparse 출력, motion은 0.6m temporal)
+  Sub-Voxel Shape Information Head (sparse)
+  3D Semantics Head (sparse)
 
-Probabilistic queryable evaluation:
-  pack query points into Q x 3 tensors
-  GaussianFormer-2-style probabilistic superposition
-  continuous occupancy / boundary / surface normal
-  render adaptive partial cuboid / local surface overlay
+Surface Outputs head (= Tesla Surface Outputs, 별도 브랜치):
+  dense BEV: z_surface / slope / step / uncertainty
 
-V1 exclusions:
-  no unbounded dense P2/P3 local image re-query
-  no full-scene Gaussian splatting
-  no image-based Gaussian initialization module
-  no dense 0.2m feature volume
-  no full 3D temporal memory
+Sub-voxel shape:
+  exposed face mask
+  face surface offset
+  local surface normal
+  shape uncertainty
+  optional thinness
+  shape code for queryable MLP
+
+Queryable output:
+  xyz + sampled F_0.3 + shape code + local coordinate
+  -> continuous occupancy / semantic / uncertainty
+
+Runtime controls:
+  exposed-face mask
+  planner-aware priority mask
+  packed query execution
 ```
 
 가장 중요한 설계 원칙:
 
 ```text
-20cm는 결과 해상도다.
-20cm는 내부 dense feature 해상도가 아니다.
+30cm는 occupied 표면의 결과 해상도다. 단 내부 표현은 dense가 아니라 sparse다.
+free / unknown 빈 공간은 coarse dense에서 처리한다 (정밀도 불필요).
+Sub-Voxel Shape Information은 30cm voxel 내부 형상을 말하는 head다.
+보이는 / 노출된 face만 더 자세히 보는 것은 head 내부의 masked execution이다.
+sparse deconv + 프루닝 = 빈 공간 제거, masked query = 표면 중 노출면만 정밀 -> 같은 철학의 두 단계.
 ```
 
 ---
@@ -1788,85 +1689,68 @@ V1 exclusions:
 ### Core Architecture
 
 1. [REO](https://github.com/ICEORY/REO)
-   - calibration-free / calibration-light vanilla attention과 query-based prediction 참고
-   - 이 문서에서는 1.6m 3D voxel query가 image tokens를 읽는 spatial lifting에 반영
+   - calibration-free / calibration-light **vanilla attention 방식**과 query-based prediction 참고
+   - 주의: REO는 이 vanilla attention을 BEV query에 적용한다. 본 문서는 그 attention "종류"만 가져오고,
+     query "타깃"은 Tesla처럼 3D voxel로 둔다 (REO 전체 파이프라인을 모사하는 것이 아님)
+   - queryable output interface에도 반영
 
 2. [ViewFormer-Occ](https://github.com/viewformerocc/viewformer-occ)
-   - streaming temporal BEV memory, ego-motion alignment, temporal attention, flow occupancy 계열 참고
-   - 이 문서에서는 1.6m feature 직후 temporal module과 Dynamic / Flow Head에 반영
+   - z-squeeze voxel->BEV temporal, streaming memory(N=4), ego-motion alignment, BEV-level occupancy flow(FlowOcc3D) 참고
+   - voxel query 100x100x8(~0.8m), GT 200x200x16(0.4m), ~4.1 FPS(RTX 3090)
+   - 이 문서에서는 0.6m 단일 BEV temporal+flow stage와 Occupancy Flow Head(BEV-level flow -> voxel 매핑)에 반영
 
-3. [PanoOcc](https://github.com/Robertwyq/PanoOcc)
-   - coarse-to-fine 3D deconvolution과 unified occupancy representation 참고
-   - 이 문서에서는 1.6m -> 0.8m -> 0.4m dense decoder에 반영
+3. BEVFormer / BEVDet4D
+   - BEV feature ego-motion alignment와 temporal fusion 위치에 대한 교훈 참고
+   - 이 문서에서는 pre-temporal refinement와 deconv 전 temporal alignment에 반영
 
-4. SparseOcc / sparse convolution 계열
-   - 중요한 영역만 sparse하게 refine하는 방식 참고
-   - 이 문서에서는 Active Mask Head와 quota Top-K refinement 영역 선택에 반영
+4. [PanoOcc](https://github.com/Robertwyq/PanoOcc)
+   - coarse-to-fine **sparse deconvolution + occupancy sparsification(프루닝)** 과 unified occupancy representation 참고
+   - PanoOcc는 3단계 sparse deconv에서 keep ratio 0.2/0.5/0.5로 점유 후보만 남겨 dense 고해상 3D conv를 회피한다
+   - 이 문서에서는 1.2m -> 0.6m -> 0.3m sparse decoder + 프루닝에 그대로 반영 (keep ratio는 원거리 보호 위해 더 보수적으로)
 
-5. [GaussianFormer](https://github.com/huang-yh/GaussianFormer) / [GaussianFormer-2](https://arxiv.org/abs/2412.04384)
-   - object-centric 3D Gaussian 표현, deformable image re-query, probabilistic Gaussian superposition 참고
-   - 이 문서에서는 Budget-K Gaussian Refinement Branch와 Probabilistic Queryable Evaluation에 반영
-   - 주의: 이미지 기반 초기화 모듈, full-scene splatting, 수만 개 단위 Gaussian은 가져오지 않는다 (Section 10)
+5. SparseOcc / sparse execution examples
+   - 모든 위치에 같은 비용을 쓰지 않고 중요한 위치만 더 비싼 연산을 쓰는 runtime idea 참고
+   - 이 문서에서는 (1) sparse decoder의 프루닝 (2) Sub-Voxel Shape Head의 exposed-face / priority masked execution 두 곳에 반영
 
-### Road Surface Geometry
+### Surface Geometry and Semantics
 
 1. [RoadBEV](https://github.com/ztsrxh/RoadBEV)
    - BEV에서 road surface elevation을 직접 예측하는 기본 참고자료
-   - `z_surface(x, y)`와 road surface geometry head를 이해하기 위해 먼저 볼 것
+   - 이 문서에서는 4개 volume head에서 surface geometry를 readout하는 관점으로 참고
 
 2. [FastRSR](https://arxiv.org/abs/2504.09535)
    - RoadBEV 계열의 효율 개선 방향 참고
    - Jetson AGX Orin 같은 embedded inference를 생각하면 RoadBEV 다음으로 볼 것
 
-3. [BEV-GS](https://arxiv.org/abs/2504.13207)
-   - road surface를 Gaussian/grid representation으로 표현하는 옵션
-   - 첫 구현 필수는 아니고, 표면 rendering이나 texture reconstruction까지 관심이 생기면 볼 것
-
-### Optional Extensions
-
-1. [MapTR](https://github.com/hustvl/MapTR)
+3. [MapTR](https://github.com/hustvl/MapTR)
    - lane, divider, boundary 같은 online vectorized HD map element 예측 참고
-   - surface semantics를 확장할 때 선택적으로 참고
+   - 3D Semantics Head와 planner readout을 확장할 때 선택적으로 참고
 
-2. [HDMapNet](https://arxiv.org/abs/2107.06307)
+4. [HDMapNet](https://arxiv.org/abs/2107.06307)
    - BEV semantic map learning의 기본 참고자료
    - road / lane / curb 같은 raster BEV semantics를 추가할 때 선택적으로 참고
 
-3. [Cam2BEV](https://github.com/ika-rwth-aachen/Cam2BEV)
-   - multi-camera image에서 BEV semantic segmentation을 만드는 고전적 참고자료
-   - surface semantics를 단순 raster BEV segmentation으로 시작할 때 선택적으로 참고
-
-4. [H3O](https://arxiv.org/abs/2503.04059)
+5. [H3O](https://arxiv.org/abs/2503.04059)
    - depth, semantic segmentation, surface normal을 3D occupancy 학습에 보조 supervision으로 쓰는 방향 참고
    - surface normal / depth / semantic auxiliary loss가 필요할 때 선택적으로 참고
 
-5. [UnScenes3D](https://www.nature.com/articles/s41597-025-05532-5)
+6. [UnScenes3D](https://www.nature.com/articles/s41597-025-05532-5)
    - 3D semantic occupancy와 road surface elevation reconstruction을 함께 정의한 데이터/태스크 참고
    - volume output과 surface geometry output을 함께 학습/평가하는 관점에서 참고
-
-6. [GaussianWorld](https://arxiv.org/abs/2412.10373)
-   - Gaussian을 ego-motion으로 이월하며 갱신하는 streaming Gaussian world model
-   - refinement Gaussian의 temporal 이월(v2)을 검토할 때 참고
-
-7. [GaussTR](https://arxiv.org/abs/2412.13193)
-   - Gaussian rendering 기반 self-supervision과 foundation model alignment
-   - sub-voxel supervision이 없을 때 rendering 기반 보조 supervision을 붙일 때 참고
 
 ### Minimal Reading Order
 
 최소로만 본다면 다음 순서를 추천한다.
 
 ```text
-1. RoadBEV
-2. FastRSR
-3. ViewFormer-Occ
+1. Tesla AI Day 2022 Occupancy Network 발표 자료
+2. ViewFormer-Occ
+3. BEVDet4D / BEVFormer temporal fusion sections
 4. REO
 5. PanoOcc
-6. SparseOcc / sparse convolution examples
-7. GaussianFormer -> GaussianFormer-2
+6. RoadBEV / FastRSR
+7. Sparse execution examples
 ```
-
-surface output을 이해하려는 목적이면 `RoadBEV -> FastRSR`를 먼저 본다. flow occupancy와 temporal memory는 `ViewFormer-Occ`, 20cm query 구조는 `REO`, coarse-to-fine decoder는 `PanoOcc`, refinement 영역 선택은 sparse convolution / SparseOcc 계열을 본다. budget-K Gaussian refinement와 probabilistic queryable evaluation은 `GaussianFormer -> GaussianFormer-2` 순서로 본다.
 
 ---
 
@@ -1881,7 +1765,7 @@ DUSt3R 아이디어 자체는 출발점이지만, vanilla DUSt3R를 직접 쓰�
 ```text
 1. scale 모호성:
    DUSt3R pointmap은 up-to-scale이다.
-   20cm metric voxel GT에는 metric scale이 필수다.
+   30cm metric voxel GT에는 metric scale이 필수다.
 
 2. pair 단위 추론 + 비싼 global alignment:
    DUSt3R는 이미지 쌍 단위로 추론하고,
@@ -1889,7 +1773,7 @@ DUSt3R 아이디어 자체는 출발점이지만, vanilla DUSt3R를 직접 쓰�
    수백~수천 frame의 주행 시퀀스에 비실용적이다.
 
 3. 정적 장면 가정:
-   동적 물체는 재구성 기하가 깨진다 (ghosting).
+   동적 물체는 재구성 기하가 깨진다.
    별도의 dynamic 분리 없이는 GT 오염이 발생한다.
 
 4. 기지 calibration을 활용하지 못함:
@@ -1904,32 +1788,31 @@ DUSt3R 아이디어 자체는 출발점이지만, vanilla DUSt3R를 직접 쓰�
 1순위: MapAnything
   metric scale 출력
   known intrinsics / pose를 입력으로 소비 가능
-  (images만: pointmap 상대오차 ~0.16,
-   images + intrinsics + pose + depth: ~0.01)
-  multi-camera rig + odometry 보유 상황에 정확히 부합
+  multi-camera rig + odometry 보유 상황에 부합
 
-대안: MASt3R / MASt3R-SfM, VGGT
+대안:
+  MASt3R / MASt3R-SfM
+  VGGT
 
-동적 분리 보조: MonST3R 또는 2D segmentation + tracking
+동적 분리 보조:
+  MonST3R 또는 2D segmentation + tracking
 ```
 
 ### Two-stage Structure
 
-DUSt3R 계열과 NeRF/3DGS는 경쟁 관계가 아니라 순차 역할 분담이다.
+DUSt3R 계열과 continuous reconstruction은 경쟁 관계가 아니라 순차 역할 분담이다.
 
 ```text
-Stage A: 기하 + 포즈 (MapAnything / MASt3R)
+Stage A: 기하 + 포즈
   metric pointmap, camera pose, dense 초기 기하
-  NeRF/3DGS는 포즈 없이 시작하지 못하므로 반드시 선행
+  후속 정제 단계는 안정적인 metric pose와 초기 기하가 있어야 시작할 수 있다.
 
-Stage B: 정제 + 연속 표면 (3DGS 권장, NeRF 가능)
-  Stage A 출력을 초기화로 photometric 최적화
+Stage B: 정제 + 연속 표면
+  Stage A 출력을 초기화로 photometric / geometric 최적화
   표면 정제 후 mesh / SDF 추출
 ```
 
-Stage B의 목적은 화질이 아니다. Stage A 점군을 voxelize하면 20cm 이산 GT까지만 나온다. Stage B가 만드는 연속 mesh/SDF가 Section 10 budget-K Gaussian refinement branch를 학습시킬 **sub-voxel continuous GT**다. 즉 Stage B는 refinement branch가 실데이터에서 학습 가능해지는 조건이다.
-
-NeRF 대신 3DGS를 권장하는 이유: 학습이 빠르고, Stage A의 점군 출력이 그대로 3DGS 초기화가 되며, mesh 추출 도구가 성숙해 있다. 동적 장면까지 neural rendering으로 다루려면 EmerNeRF-style static/dynamic decomposition을 참고한다.
+Stage B의 목적은 화질이 아니다. Stage A 점군을 voxelize하면 30cm 이산 GT까지만 나온다. Stage B가 만드는 연속 mesh/SDF가 Sub-Voxel Shape Information Head와 Queryable MLP를 학습시킬 **sub-voxel continuous GT**다.
 
 ### Pipeline
 
@@ -1944,9 +1827,9 @@ NeRF 대신 3DGS를 권장하는 이유: 학습이 빠르고, Stage A의 점군 
 
 4. 정적:      static 점군 multi-frame aggregation -> TSDF fusion
               -> mesh / SDF
-              -> 20cm voxelize -> volume occupancy GT
-              -> ground segmentation -> z_surface / valid GT
-              -> 연속 SDF 보존 -> sub-voxel GT
+              -> 30cm voxelize -> volume occupancy GT
+              -> ground / road segmentation -> Surface Outputs head GT (z_surface 등)
+              -> 연속 SDF 보존 -> sub-voxel shape GT
 
 5. 가시성:    per-frame camera ray casting -> free / unknown 분리
               (free != unknown 라벨의 유일한 출처)
@@ -1954,7 +1837,8 @@ NeRF 대신 3DGS를 권장하는 이유: 학습이 빠르고, Stage A의 점군 
 6. 동적:      per-frame instance volume + track association
               -> dynamic occupancy + occupancy flow GT
 
-7. 옵션:      3DGS refinement -> 표면 정밀화 + 연속 GT 강화
+7. 옵션:      neural SDF / NeRF refinement
+              -> 표면 정밀화 + 연속 GT 강화
 
 8. 검증:      같은 파이프라인을 nuScenes에 적용
               -> Occ3D LiDAR GT와 정량 비교
@@ -1964,20 +1848,31 @@ NeRF 대신 3DGS를 권장하는 이유: 학습이 빠르고, Stage A의 점군 
 ### Head별 GT 매핑
 
 ```text
-Volume Occupancy Head:
+Occupancy Head (coarse dense 갈래 @ 0.6m):
   step 4 voxelize + step 5 visibility
+  -> 0.6m로 다운샘플한 free / unknown / occupied GT
 
-Road Surface Geometry Head:
-  step 4 ground segmentation (z_surface / valid / uncertainty)
+Occupancy Head (sparse fine 갈래 @ 0.3m) + 프루닝:
+  step 4 voxelize의 occupied GT
+  -> 0.6m / 0.3m scale에서 multi-scale occupancy supervision
+  -> 프루닝 keep/drop 학습 (occupied GT가 keep 타깃)
+  주의: GT에서 occupied인 voxel이 프루닝되면 영구 손실 -> recall 우선 keep ratio
 
-Dynamic / Flow Head:
+Occupancy Flow Head:
   step 6 tracking
+  -> 0.6m BEV-level flow GT (ViewFormer FlowOcc3D 방식), 0.3m voxel로 매핑
 
-Active Mask / quota Top-K:
-  base GT에서 유도 (boundary / uncertainty score)
+Sub-Voxel Shape Information Head:
+  step 4 / 7의 연속 SDF와 boundary samples
+  exposed face / local offset / normal / uncertainty supervision
 
-Budget-K Gaussian Refinement Branch:
-  step 4 / 7의 연속 SDF (sub-voxel supervision)
+3D Semantics Head:
+  static / dynamic segmentation
+  road / vehicle / pedestrian / curb / wall 등 semantic labels
+
+Surface Outputs head:
+  ground / road segmentation + 연속 표면(SDF/mesh)
+  -> per-BEV-cell z_surface / slope / step / valid / uncertainty
 ```
 
 ### Limitations
@@ -1985,10 +1880,9 @@ Budget-K Gaussian Refinement Branch:
 ```text
 원거리 정확도:
   camera 기반 depth 오차는 거리에 따라 급증한다.
-  20cm GT 신뢰 범위는 현실적으로 ~20-25m.
+  30cm GT 신뢰 범위도 원거리에서는 급격히 낮아진다.
   far-field는 GT uncertainty를 낮춰 loss weight를 줄이거나
   unknown으로 라벨한다.
-  이 부분은 LiDAR GT 대비 구조적 열세이며 회피 불가다.
 
 검증 없는 적용 금지:
   자체 데이터에는 비교 기준이 없으므로,
@@ -2002,7 +1896,7 @@ Budget-K Gaussian Refinement Branch:
 ### References
 
 1. [DUSt3R](https://github.com/naver/dust3r) / [MASt3R](https://github.com/naver/mast3r)
-   - pointmap 기반 unconstrained 3D 재구성의 출발점 (Naver Labs)
+   - pointmap 기반 unconstrained 3D 재구성의 출발점
 
 2. [MapAnything](https://github.com/facebookresearch/map-anything)
    - metric feed-forward 재구성, known calibration/pose 입력 소비
@@ -2037,12 +1931,12 @@ Basalt VIO 산출물:
 
 ```text
 pose:
-  Section 6 temporal BEV memory의 ego-motion warp 입력
+  Section 7 temporal BEV memory의 ego-motion warp 입력
 
 중력 방향:
   voxel grid의 z축을 차체가 아니라 중력에 정렬
   차체 pitch/roll에도 grid가 흔들리지 않음
-  Section 1의 z range [-1m, +4m]는 이 중력 정렬 기준이다
+  Section 1의 z range [-2m, +4m]는 이 중력 정렬 기준이다
 ```
 
 ### B. Landmark -> Sparse Depth Supervision (v1, 학습)
@@ -2056,15 +1950,15 @@ landmark를 이미지에 재투영
 -> landmark covariance로 loss 가중
 ```
 
-주의: landmark는 코너/텍스처 영역에만 찍히므로 분포가 편향된다 (흰 벽, 균일한 노면에는 없음). Section 19의 dense GT를 대체하지 않고 보완한다. 운영 중 공짜로 계속 쌓이는 것이 장점이다.
+주의: landmark는 코너/텍스처 영역에만 찍히므로 분포가 편향된다. Section 19의 dense GT를 대체하지 않고 보완한다. 운영 중 공짜로 계속 쌓이는 것이 장점이다.
 
 ### C. Landmark 입력 주입 (v1.5)
 
-supervision을 넘어 추론 시 입력 힌트로도 쓸 수 있다. MapAnything이 known geometry 입력으로 정확도가 급상승하는 것과 같은 원리로, vanilla attention의 기하 힌트 부족을 보완한다.
+supervision을 넘어 추론 시 입력 힌트로도 쓸 수 있다. known geometry 입력이 vanilla attention의 기하 힌트 부족을 보완한다.
 
 ```text
 방법 1: voxel grid prior
-  landmark 3D 위치를 1.6m voxel grid에 splat
+  landmark 3D 위치를 1.2m voxel grid에 splat
   -> sparse 점유 prior 채널
 
 방법 2: landmark token
@@ -2083,11 +1977,11 @@ VIO가 reprojection / epipolar 불일치로 기각한 track은 동적 물체 위
 
 ```text
 기각된 track의 픽셀 / 방향
--> dynamic head의 weak pseudo-label
--> active mask dynamic quota의 후보 영역
+-> Occupancy Flow Head의 weak pseudo-label
+-> dynamic boundary query priority 증가
 ```
 
-노이즈가 많으므로(조명 변화, occlusion도 기각됨) 단독 라벨이 아니라 약한 보조 신호로만 쓴다.
+노이즈가 많으므로 단독 라벨이 아니라 약한 보조 신호로만 쓴다.
 
 ### E. Landmark Ray -> Free Space 증거 (v1.5)
 
