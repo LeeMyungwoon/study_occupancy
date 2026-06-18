@@ -34,7 +34,7 @@
 | BEVFormer / BEVDet4D | BEV feature ego-motion alignment, temporal fusion 위치에 대한 교훈 | pre-temporal refinement, coarse temporal fusion |
 | PanoOcc | coarse-to-fine **sparse deconvolution + occupancy 프루닝**, unified occupancy representation | 1.2m -> 0.6m -> 0.3m sparse decoder (단계마다 점유 후보만 keep) |
 | SparseOcc / sparse execution 계열 | 중요한 위치만 더 비싼 연산을 실행하는 runtime control | sparse decoder의 프루닝 + Sub-Voxel Shape Head의 masked / face-aware execution |
-| RoadBEV / FastRSR | BEV에서 road surface elevation을 직접 예측하는 관점 | 4개 volume head에서 surface geometry를 readout하는 방식 |
+| RoadBEV / FastRSR | BEV에서 road surface elevation을 직접 예측하는 관점 | 별도 Surface Outputs head(dense BEV)에서 z_surface 직접 회귀, geometry only (Section 11) |
 
 특히 spatial lifting은 **vanilla cross-attention**을 기본으로 한다. projection-first deformable attention을 기본 구조로 두지 않고, 1.2m 3D voxel query가 multi-camera image tokens를 `Q/K/V` attention으로 읽는 방식이다.
 
@@ -234,9 +234,10 @@ Tesla 발표 그림과 비슷한 블록 흐름으로 보면 다음과 같다.
        v                                        v
 +---------------------------+        +-------------------------------+
 | Surface Outputs (별도 head)|       | Queryable Output Interface    |
-| = Tesla "Surface Outputs" |        | pruned 영역 -> free/unknown 즉답|
-| dense BEV: z_surface,     |        | occupied 근처 -> sparse feat  |
-| slope, step, uncertainty  |        | + shape code + local coord    |
+| = Tesla Road Surface       |       | kept -> sparse feat+shape query|
+|   Geometry (geometry only) |       | pruned -> 부모 0.6m coarse로   |
+| dense BEV: z_surface,      |       |   보수적 판정 (free일 때만 free)|
+| slope, step, uncertainty  |        |   occupied/uncertain -> occupied|
 +---------------------------+        +-------------------------------+
 ```
 
@@ -833,6 +834,21 @@ PanoOcc는 sparse deconv에서 keep ratio 0.2 / 0.5 / 0.5를 쓴다. 그러나 �
 
 프루닝 결정은 0.6m coarse dense occupancy head의 occupied 확률로 한다(별도 score 헤드 불필요). multi-scale occupancy supervision을 받는다.
 
+**Quota 기반 keep (v1.5).** 단일 keep ratio + top-k는 occupancy 점수만 보므로 **얇은 물체 / 원거리 / 저신뢰 occupied가 체계적으로 먼저 잘린다**(프루닝은 비가역 -> false negative 영구 손실). v1.5에서는 카테고리별 최소 quota를 둬 보호한다.
+
+```text
+keep quota (v1.5):
+  near-field occupied candidates
+  far-field low-confidence candidates
+  dynamic candidates
+  planner corridor
+  thin-object / high-gradient candidates
+  random exploration quota
+
+-> 각 카테고리에 최소 keep을 보장해 단순 top-k가 놓치는 후보를 살린다.
+   v1은 "far-field keep 상향"으로 단순 시작, v1.5에서 quota로 강화.
+```
+
 ### 8.3 이전 버전과의 차이
 
 ```text
@@ -988,6 +1004,17 @@ free / unknown voxel:
   flow loss 약하게 또는 ignore
 ```
 
+motion 해상도 한계 (명시):
+
+```text
+v1: motion 해상도 상한 = 0.6m.
+    0.3m flow output은 0.6m BEV flow를 sparse surface voxel에 매핑한 것이다.
+    0.3m에서 새로운 motion 정보가 생기지 않는다.
+
+v1.5 (필요 시): F_0.3_sparse 기반 small residual flow head를 추가해
+    0.3m 수준 motion을 보정한다 (full 0.3m temporal은 여전히 금지).
+```
+
 ### 9.3 Sub-Voxel Shape Information Head
 
 Sub-Voxel Shape Information Head는 30cm voxel 내부의 local shape를 표현한다.
@@ -1029,10 +1056,22 @@ camera visibility:
 for each kept (occupied/boundary) voxel v:
   for face in [+x, -x, +y, -y, +z, -z]:
     neighbor = voxel adjacent to face
-    exposed_face[face] = (neighbor가 프루닝됨) or (neighbor가 free/unknown)
+    if neighbor가 kept(occupied surface):
+      exposed_face[face] = false   (표면끼리 맞닿음)
+    else:  # neighbor가 프루닝됨 = fine 표면 증거 없음
+      exposed_face[face] = exposed candidate
+      # 그 면이 free / unknown / uncertain인지는 부모 0.6m coarse occupancy로 구분
 ```
 
-sparse 표현에서는 **프루닝된 neighbor가 곧 free/unknown 공간**이므로, exposed-face 판정이 자연스럽게 맞아떨어진다. 즉 살아남은 voxel의 6-neighbor 중 비어있는(프루닝된) 방향이 곧 노출된 면이다. 이 head는 `F_0.3_sparse`의 kept voxel 위에서만 동작하므로, 모든 voxel을 dense하게 도는 비용이 처음부터 없다.
+중요: **프루닝됨 = "fine 30cm 표면 증거 없음"이지 곧 free가 아니다.** 프루닝된 voxel에는 빈 공간뿐 아니라 **물체 내부(표면 뒤 꽉 찬 부분)** 도 섞인다. 따라서 neighbor가 프루닝되면 그 면은 "exposed **candidate**"로 두고, 실제 free / unknown / uncertain 여부는 **부모 0.6m coarse occupancy**로 판정한다.
+
+```text
+neighbor 프루닝 + 부모 coarse free      -> exposed-to-free (진짜 노출면)
+neighbor 프루닝 + 부모 coarse unknown   -> exposed-to-unknown (occlusion 경계)
+neighbor 프루닝 + 부모 coarse occupied  -> 내부 경계일 수 있음, 노출면 아님 (보수적)
+```
+
+이 head는 `F_0.3_sparse`의 kept voxel 위에서만 동작하므로, 모든 voxel을 dense하게 도는 비용이 처음부터 없다.
 
 권장 출력:
 
@@ -1165,17 +1204,17 @@ Queryable output은 별도 volume head가 아니다. 4개 head가 만든 sparse 
 ```text
 query point x, y, z
 -> 30cm voxel index 찾기
--> 이 voxel이 프루닝됨?
-     yes -> coarse dense occupancy를 읽어 free / unknown 즉답 (MLP 생략)
-     no  -> 아래 정밀 경로
--> local coordinate u in voxel
--> sample F_0.3_sparse (kept voxel)
--> sample shape_code / shape parameters
--> small Queryable MLP
--> continuous occupancy / semantic / uncertainty
+-> 이 voxel이 kept(살아남음)?
+     yes -> 정밀 경로:
+            local coord u + sample F_0.3_sparse + shape_code
+            -> small Queryable MLP -> continuous occupancy / semantic / uncertainty
+     no(프루닝됨) -> 부모 0.6m coarse occupancy를 읽어 보수적 판정 (MLP 생략):
+            high-confidence free  -> free
+            unknown / occluded    -> unknown
+            occupied / uncertain  -> occupied (내부일 수 있음, free로 답하지 않음)
 ```
 
-즉 빈 공간(프루닝된 영역) query는 비싼 MLP를 타지 않고 coarse dense occupancy로 바로 답한다. 정밀 MLP는 occupied 표면 근처 query에만 실행된다.
+핵심: **프루닝됨은 곧 free가 아니다.** 프루닝된 칸에는 빈 공간과 물체 내부가 섞여 있으므로, 부모 coarse가 **확실히 free일 때만 free**로 답하고, occupied/uncertain이면 보수적으로 occupied(또는 fine-level unknown)로 답한다. 이렇게 하면 차량 내부 등 solid interior를 free로 오답하는 충돌 위험을 막는다. 정밀 MLP는 kept(occupied 표면) voxel 근처 query에만 실행된다.
 
 입력:
 
@@ -1234,7 +1273,7 @@ QueryableMLP를 한 번 또는 큰 batch 몇 번으로 실행
 
 ---
 
-## 11. Surface Outputs Head (Tesla-style 별도 브랜치)
+## 11. Surface Outputs Head (Tesla-style 별도 브랜치, Geometry only)
 
 Tesla AI Day 2022 그림에서 Surface Outputs는 Volume Outputs와 **나란한 별도 출력 브랜치**다(Queryable Outputs와도 분리). 본 문서도 이를 따라, road surface geometry를 4개 volume head의 readout 후처리가 아니라 **독립 head**로 둔다.
 
@@ -1245,37 +1284,44 @@ Tesla 그림의 출력 그룹:
   Queryable Outputs = MLP 인터페이스 (Section 10)
 ```
 
+**Geometry only (Road Surface Semantics는 두지 않는다).** Tesla 그림의 Surface Outputs는 실제로 두 갈래 — `Road Surface Geometry`(높이/형상)와 `Road Surface Semantics`(차선/주행영역 같은 노면 평면 raster) — 다. 그러나 본 시스템은 **실내 및 실외(도로 아님)** 대상이라 차선/도로표시 같은 노면 semantic이 없다. 따라서 Road Surface Semantics 갈래는 두지 않고 **Geometry만** 둔다. (필요하면 v1.5에서 "traversable / non-traversable" 정도의 축소된 노면 semantic만 선택적으로 추가.)
+
 ### 11.1 입력과 출력
 
-Surface는 노면 높이장(z_surface)으로, BEV column마다 하나의 매끄러운 값이다. 따라서 sparse 표면 voxel이 아니라 **0.6m dense feature를 입력으로 받는 dense BEV head**로 두는 것이 자연스럽다(RoadBEV식 BEV elevation regression).
+Surface는 바닥 높이장(z_surface)으로, BEV column마다 하나의 매끄러운 값이다. 따라서 sparse 표면 voxel이 아니라 **0.6m dense feature만 입력으로 받는 self-contained dense BEV head**로 둔다(RoadBEV식 BEV elevation regression). sparse head(3D Semantics, Sub-Voxel Shape) 출력을 입력으로 끌어오지 않는다 — sparse->dense 역류와 실행 순서 의존을 피하기 위함이다.
 
 ```text
 input:
-  F_0.6_temporal (dense, 100 x 34 x 10)
+  F_0.6_temporal (dense, 100 x 34 x 10)  <- 이것만 사용 (self-contained)
   -> ZPool / BEV projection -> 100 x 34 x C_bev
-  (보조 입력) coarse occupancy, 3D semantics의 ground/road 채널
 
-output (dense BEV, 0.6m 격자 또는 0.3m로 upsample):
-  z_surface        : 노면 높이
+output (dense BEV, 0.6m 격자 또는 0.3m로 upsample -> 수평 선명도 향상):
+  z_surface        : 바닥 높이 (연속 회귀, 격자에 안 묶임 -> cm급 가능)
   valid            : 유효/관측 여부
   uncertainty      : 높이 불확실도
   slope / normal   : 경사
   step_height      : 연석 / 계단 높이
 ```
 
-### 11.2 다른 head와의 관계
+### 11.2 다른 head와의 관계 (입력 의존이 아니라 분업 + consistency loss)
 
-별도 head지만, 정밀 geometry는 volume head 출력을 보조로 쓴다.
+Surface head는 **자립**한다. 다른 head 출력을 입력으로 받지 않는다. 대신 세부 바닥 기하를 두 경로로 나눠 담당하고, 둘을 consistency loss로 묶는다.
 
 ```text
-Occupancy Head:        riser / vertical face / obstacle boundary
-Sub-Voxel Shape Head:  exposed face, local normal, offset (z_surface sub-voxel 정밀화)
-3D Semantics Head:     road / curb / barrier / stair-like class
+Surface Outputs Head (dense, 0.6m feature):
+  매끄러운 z_surface 전역 높이장. 경사 / 완만한 ramp / 관측 안 된 곳 보간.
+  장점: 어디든 값이 있음. 한계: 날카로운 모서리는 다소 뭉개짐.
 
-Surface Outputs Head:  위를 종합해 z_surface, slope, step, uncertainty를 직접 예측
+sparse 0.3m kept 바닥 voxel + Sub-Voxel Shape offset:
+  연석 lip / 단차 edge 같은 날카로운 sub-30cm 기하.
+  바닥은 occupied 표면이라 kept. offset/normal이 30cm 아래 표면 위치까지 잡음.
+
+결합:
+  consistency loss로 두 경로 z를 일치시킴 (입력 의존 아님).
+  planner는 "Surface head 전역 높이장 + 날카로운 곳은 sparse offset"을 융합해 사용.
 ```
 
-핵심: z_surface의 수직 정밀도는 0.3m 격자에 갇히지 않도록, Sub-Voxel Shape Head의 surface offset을 반영한다(단순 occupancy boundary만으로 유도하지 않는다).
+핵심: z_surface 수직 정밀도는 회귀라 0.3m 격자에 갇히지 않는다. 단 가장 날카로운 연석/단차의 위치 정밀도는 sparse sub-voxel offset이 authority다(Surface head는 매끄러운 base).
 
 ### 11.3 학습
 
@@ -1285,11 +1331,13 @@ GT:
   per-BEV-cell z_surface / slope / step / valid 라벨 생성
 
 loss:
-  z_surface regression (valid mask),
-  uncertainty는 heteroscedastic 또는 ensemble로 학습
+  z_surface regression (valid mask)
+  uncertainty: heteroscedastic 또는 ensemble
+  consistency loss: Surface head z_surface <-> sparse kept 바닥 voxel의
+    sub-voxel surface 높이가 같은 (x,y)에서 일치하도록 (soft coupling)
 ```
 
-v1에서도 Tesla처럼 별도 head로 두되, 모듈은 가볍게(BEV conv 몇 layer) 시작한다.
+v1에서도 Tesla처럼 별도 head로 두되, 모듈은 가볍게(BEV conv 몇 layer) 시작한다. 3D Semantics에는 의존하지 않는다(Geometry only).
 
 ---
 
@@ -1321,15 +1369,20 @@ S_query =
 20 FPS v1에서는 모든 voxel에 heavy query를 수행하지 않는다.
 
 ```text
-매 frame dense 실행:
-  F_0.3 trunk
-  Occupancy Head
+매 frame dense 실행 (0.6m dense):
+  F_0.6 temporal trunk
+  coarse occupancy / visibility @ 0.6m
+  Surface Outputs head (dense BEV geometry)
+
+매 frame sparse 실행 (0.3m sparse):
+  sparse deconv + prune 0.6m -> 0.3m
+  Occupancy fine head (occupied 표면)
   Occupancy Flow Head
   cheap Sub-Voxel Shape parameters
   3D Semantics Head
 
 masked / budgeted 실행:
-  local sub-voxel query
+  expensive local sub-voxel query
   queryable MLP
   planner-triggered high-detail readout
 ```
@@ -1716,7 +1769,7 @@ sparse deconv + 프루닝 = 빈 공간 제거, masked query = 표면 중 노출�
 
 1. [RoadBEV](https://github.com/ztsrxh/RoadBEV)
    - BEV에서 road surface elevation을 직접 예측하는 기본 참고자료
-   - 이 문서에서는 4개 volume head에서 surface geometry를 readout하는 관점으로 참고
+   - 이 문서에서는 별도 Surface Outputs head(geometry only)가 0.6m dense feature에서 z_surface를 직접 회귀하는 방식에 반영 (Section 11)
 
 2. [FastRSR](https://arxiv.org/abs/2504.09535)
    - RoadBEV 계열의 효율 개선 방향 참고
