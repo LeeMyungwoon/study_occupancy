@@ -18,11 +18,11 @@ frame budget: 50 ms
 v1 runtime 원칙:
 
 ```text
-1. 20cm dense feature volume은 만들지 않는다.
-2. dense occupancy는 structured sub-voxel head로 만든다.
-3. QueryableMLP는 selected K/Q budget 안에서만 실행한다.
+1. 0.3m dense feature volume은 만들지 않는다 (sparse deconv + 2단 게이트 prune).
+2. free/unknown은 0.6m coarse dense, occupied 표면은 0.3m sparse (+ near-surface free shell).
+3. QueryableMLP(occupancy 전용)는 selected K/Q budget 안에서만 실행한다.
 4. P2/P3 local image re-query는 v1에서 제외한다.
-5. temporal memory는 1.6m BEV memory로 제한한다.
+5. temporal은 0.6m 3D(z 유지, align+concat+3D conv)로 한다. Orin 예산 초과 시 1.2m 3D fallback.
 6. profiling은 평균만 보지 않고 p50/p95/max를 같이 본다.
 7. PyTorch eager에서 20 FPS가 안 나와도 stage별 병목을 정확히 기록한다.
 ```
@@ -33,17 +33,20 @@ Phase 10에서는 모든 실험이 같은 stage 이름을 사용해야 한다.
 
 ```text
 image_backbone
-vanilla_cross_attention_16m
-temporal_memory
-deconv_16_to_08
-deconv_08_to_04
-structured_occupancy_head
-surface_head
-flow_head
-active_mask
-quota_topk
+vanilla_cross_attention_12m
+dense_deconv_12_to_06
+pre_temporal_refine_06m        # BEVDet4D 교훈
+temporal_3d_06m
+sparse_deconv_06_to_03_2gate   # 게이트①parent + 게이트②child + near-surface free shell
+occupancy_head                 # coarse dense + sparse fine
+subvoxel_shape_head            # offset/normal/shape_code/thinness
+semantics_head                 # voxel-level
+surface_head                   # z-flatten
+flow_head                      # vx,vy,vz
+exposed_face_mask
+quota_keep
 sparse_anchor
-packed_queryable_mlp
+packed_queryable_mlp           # occupancy 전용
 visualization_optional
 ```
 
@@ -71,15 +74,18 @@ def profile_model(model, batch, warmup=20, iters=100):
 
 ```text
 image_backbone
-vanilla_cross_attention_16m
-temporal_memory
-deconv_16_to_08
-deconv_08_to_04
-structured_occupancy_head
+vanilla_cross_attention_12m
+dense_deconv_12_to_06
+pre_temporal_refine_06m
+temporal_3d_06m
+sparse_deconv_06_to_03_2gate
+occupancy_head
+subvoxel_shape_head
+semantics_head
 surface_head
 flow_head
-active_mask
-quota_topk
+exposed_face_mask
+quota_keep
 sparse_anchor
 packed_queryable_mlp
 ```
@@ -98,7 +104,7 @@ packed_queryable_mlp
 ```text
 stage                         p50_ms  p95_ms  mean_ms  max_ms
 image_backbone                 12.3    14.1    12.6     16.0
-vanilla_cross_attention_16m      5.8     6.4     5.9      7.1
+vanilla_cross_attention_12m      5.8     6.4     5.9      7.1
 ...
 total                          43.5    51.2    44.1     58.0
 ```
@@ -179,12 +185,13 @@ stage별 주요 tensor shape 기록
 model parameter memory
 activation peak memory
 input image feature memory
-1.6m feature memory
-0.4m dense feature memory
-20cm occ_logits memory
+1.2m feature memory
+0.6m dense feature memory
+0.3m sparse kept feature memory (표면 + near-surface free shell)
+occ_logits memory (0.6m coarse + 0.3m sparse fine)
 surface output memory
-flow output memory
-refinement packed query memory
+flow output memory (vx,vy,vz)
+queryable packed query memory
 ```
 
 shape/memory 표 예시:
@@ -201,10 +208,10 @@ notes
 중요 체크:
 
 ```text
-20cm dense occupancy logits는 괜찮지만,
-20cm dense feature volume은 금지다.
-0.4m dense feature가 가장 큰 feature tensor 후보인지 확인한다.
-flow를 20cm dense로 만들 경우 memory가 커지는지 확인한다.
+0.3m sparse occupancy는 괜찮지만,
+0.3m dense feature volume(272k)은 금지다.
+0.6m dense feature가 가장 큰 dense feature tensor 후보인지 확인한다.
+near-surface free shell로 0.3m kept가 ~1.5~2배 되는 영향을 확인한다.
 ```
 
 완료 기준:
@@ -313,15 +320,15 @@ A6:
 완료 기준:
 
 ```text
-refinement를 켰을 때 dense occupancy output은 그대로 유지된다.
-fine overlay가 별도 output으로 나온다.
+queryable을 켰을 때 coarse/fine occupancy output은 그대로 유지된다.
+sparse surface representation(queryable)이 별도 output으로 나온다.
 K/Q budget을 넘지 않는다.
 ```
 
 주의:
 
 ```text
-refinement가 quality를 올리지 못하면 v1에서 K/Q를 줄이거나 10 FPS multi-rate branch로 둔다.
+queryable이 quality를 올리지 못하면 v1에서 K/Q를 줄이거나 10 FPS multi-rate branch로 둔다.
 기본 20 FPS perception을 망치면 안 된다.
 ```
 
@@ -364,15 +371,18 @@ image_backbone이 느림:
   input resolution 축소, backbone 경량화, TensorRT 우선순위.
 
 cross_attention이 느림:
-  1.6m grid 크기 확인, channel 축소, head 수 축소.
+  1.2m grid 크기 확인, channel 축소, head 수 축소.
 
-deconv가 느림:
-  channel 축소, ConvTranspose3d kernel/stride 재검토.
+temporal이 느림:
+  0.6m 3D -> 1.2m 3D fallback (z 유지), history N 축소.
+
+deconv/sparse prune이 느림:
+  channel 축소, keep_ratio 조정, near-surface free shell off, sparse conv 커널 최적화.
 
 flow가 느림:
-  flow head를 0.4m grid 또는 10 FPS로 제한.
+  flow는 0.6m 3D motion 기준이므로 history/channel 축소.
 
-refinement가 느림:
+queryable이 느림:
   K_total/Q_total 축소, avg M_i 축소, 10 FPS multi-rate.
 ```
 
@@ -397,9 +407,9 @@ phases/phase_10_runtime_final_report/reports/onnx_export_notes.md
 전체 export가 어려우면 부분 export라도 한다.
 우선순위:
 1. image backbone
-2. decoder + structured occupancy head
-3. surface head
-4. packed QueryableMLP
+2. dense 경로 (1.2m->0.6m deconv + occupancy head)  # sparse deconv는 TensorRT 지원 약함
+3. surface head (z-flatten)
+4. packed QueryableMLP (occupancy 전용)
 ```
 
 체크할 것:
@@ -454,13 +464,13 @@ final_occnet_v1/README.md
 
 ```text
 camera image features
--> vanilla cross attention at 1.6m
--> ViewFormer-style BEV temporal memory
--> deconv 1.6m to 0.8m
--> deconv 0.8m to 0.4m
--> structured 20cm occupancy head
--> surface / flow / active mask
--> sparse selected QueryableMLP refinement
+-> vanilla cross attention at 1.2m
+-> dense deconv 1.2m to 0.6m
+-> 0.6m 3D temporal (align+concat+3D residual conv, z 유지) + per-voxel flow(vx,vy,vz)
+-> coarse dense occupancy/visibility @ 0.6m (free/unknown + 프루닝 게이트 기준)
+-> sparse deconv + 2단 게이트 prune (게이트①0.6m parent + 게이트②0.3m child) + near-surface free shell
+-> occupancy fine / surface(z-flatten) / flow heads
+-> exposed-face mask + packed QueryableMLP (occupancy 전용; pruned 영역은 coarse 즉답)
 ```
 
 완료 기준:
@@ -481,10 +491,10 @@ phases/phase_10_runtime_final_report/reports/final_report.md
 
 ```text
 1. 최종 구현 개요
-2. occupancy output 결과
-3. surface output 결과
-4. temporal/flow 결과
-5. dynamic-resolution refinement 결과
+2. occupancy output 결과 (0.6m coarse + 0.3m sparse fine)
+3. surface output 결과 (z-flatten)
+4. temporal(0.6m 3D)/flow(vx,vy,vz) 결과
+5. sparse deconv + 2단 게이트 prune + queryable 결과
 6. metric table
 7. latency table
 8. memory table

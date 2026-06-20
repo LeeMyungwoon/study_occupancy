@@ -1,6 +1,6 @@
 # Daily 6-Month Implementation Plan for `occupancy_network_architecture.md`
 
-이 문서는 하루 1시간, 평일 5일 기준 26주, 총 130일 동안 `occupancy_network_architecture.md`의 구조를 실제 구현 가능한 단계로 쌓아 올리는 계획이다.
+이 문서는 하루 1시간, 평일 5일 기준 26주, 총 130일(+ 보강일 D081a / D101a / D101b 3일 = 133일) 동안 `occupancy_network_architecture.md`의 구조를 실제 구현 가능한 단계로 쌓아 올리는 계획이다. 보강일은 아키텍처의 4 volume head와 pre-temporal refinement를 빠짐없이 덮기 위해 끼워 넣은 짧은 day다.
 
 주말은 공식 커리큘럼에 넣지 않는다. 주말은 밀린 날 보충, 시각화 개선, 논문 보충 읽기, 코드 정리에 사용한다.
 
@@ -13,31 +13,34 @@
 ```text
 multi-camera image
 -> image backbone + FPN/BiFPN-lite
--> 1.6m 3D query vanilla cross-attention
--> ViewFormer-style 1.6m BEV temporal memory
--> 3D deconv: 1.6m -> 0.8m -> 0.4m
--> structured 20cm occupancy head
--> road surface geometry head
--> dynamic / flow head
--> active mask + quota Top-K
--> sparse local feature anchor
--> packed adaptive Queryable MLP
+-> 1.2m 3D query vanilla cross-attention
+-> dense deconv: 1.2m -> 0.6m
+-> 0.6m pre-temporal refinement (BEVDet4D 교훈: temporal 전 정리)
+-> Tesla/PanoOcc-style 0.6m 3D temporal (z 유지, align+concat+3D residual conv, NOT attention)
+-> coarse dense occupancy/visibility @ 0.6m (free/unknown + 프루닝 게이트 기준)
+-> sparse deconv + 2단 게이트 prune (0.6m parent gate + 0.3m child prune) + near-surface free shell
+-> 30cm sparse surface feature (kept voxels)
+-> Tesla-style 4 volume heads (Occupancy / Flow(vx,vy,vz) / Sub-Voxel Shape / 3D Semantics)
+-> Surface Outputs head (z-flatten, geometry only)
+-> active/exposed-face mask
+-> packed Queryable MLP (occupancy 전용)
 ```
 
 20 FPS v1 원칙:
 
 ```text
 금지:
-  dense 0.2m feature volume
-  dense 0.2m deconvolution
-  모든 20cm voxel에 generic GridSample + MLP 호출
-  full 3D temporal memory
+  dense 0.3m feature volume (272k voxel)
+  dense 0.3m deconvolution
+  z-squeeze BEV temporal / temporal attention (Tesla/PanoOcc와 다름)
+  full-res(0.3m) / full global temporal memory
   P2/P3 local image re-query in v1
 
 필수:
-  0.4m까지만 dense feature 유지
-  20cm dense output은 structured sub-voxel channel head
-  Queryable MLP는 selected voxel refinement에만 사용
+  1.2m -> 0.6m까지만 dense feature 유지
+  0.6m 3D temporal (z 유지, align+concat+3D residual conv)
+  0.6m -> 0.3m은 sparse deconv + 2단 게이트 prune (keep ~0.5) + near-surface free shell
+  Queryable MLP는 selected voxel(occupancy 전용) 평가에만 사용
   K_total / Q_total hard cap
   packed batched Queryable MLP
   one-batch overfit
@@ -46,15 +49,16 @@ multi-camera image
 참고:
 
 ```text
-architecture 문서의 refinement 최종 형태는
-budget-K Gaussian refinement branch (GaussianFormer 계열)다.
+architecture 문서의 최종 30cm 표현은
+sparse deconv + 2단 게이트 프루닝(0.6m parent gate + 0.3m child prune)으로
+점유 표면 voxel만 남기고, near-surface free 1겹(L2)을 함께 keep한다.
+(dense 0.3m feature volume은 만들지 않는다.)
 
-이 plan의 Phase 08은 같은 인터페이스
-(selected voxel -> local context -> 임의 점 평가)를 가진
-packed Queryable MLP baseline을 만든다.
+이 plan의 Phase 04는 학습 초기엔 dense 프로토타입으로 0.3m occupancy를 만들고,
+Phase 08에서 sparse deconv + 2단 게이트 prune으로 전환한다
+(architecture 문서 Section 16 Stage 1의 권장 순서).
 
-Gaussian 교체는 6개월 커리큘럼에 넣지 않고
-D130의 다음 3개월 트랙에서 ablation으로 진행한다.
+Queryable은 Tesla 2-MLP 중 occupancy MLP만 둔다(semantic은 3D Semantics Head).
 ```
 
 ---
@@ -89,7 +93,7 @@ study_occupancy/
       scripts/
       notes.md
 
-    phase_04_deconv_structured_head/
+    phase_04_deconv_occupancy_head/
       src/
       tests/
       scripts/
@@ -114,7 +118,7 @@ study_occupancy/
       scripts/
       notes.md
 
-    phase_08_dynamic_resolution_refinement/
+    phase_08_sparse_prune_queryable/
       src/
       tests/
       scripts/
@@ -163,19 +167,22 @@ Phase 03, D021-D035:
   Q/K/V attention, image token, 3D query lifting
 
 Phase 04, D036-D050:
-  1.6m -> 0.4m deconv, structured 20cm occupancy head
+  1.2m -> 0.6m -> 0.3m deconv, 0.3m occupancy head (dense 프로토타입)
 
 Phase 05, D051-D065:
   multi-camera token packing, canonical ray PE, single-frame occupancy training
 
 Phase 06, D066-D080:
-  RoadBEV-style surface geometry head
+  RoadBEV-style surface geometry head (z-flatten, geometry only)
 
-Phase 07, D081-D095:
-  ViewFormer-style temporal BEV memory, dynamic / flow head
+Phase 07, D081-D095 (+D081a):
+  0.6m pre-temporal refinement(D081a),
+  Tesla/PanoOcc-style 0.6m 3D temporal (align+concat+3D conv), per-voxel flow head (vx,vy,vz)
 
-Phase 08, D096-D110:
-  active mask, quota Top-K, sparse anchor, packed Queryable MLP
+Phase 08, D096-D110 (+D101a, D101b):
+  sparse deconv + 2단 게이트 prune + near-surface free shell,
+  active/exposed-face mask, Sub-Voxel Shape Head(D101a), 3D Semantics Head(D101b),
+  quota keep, sparse anchor, packed Queryable MLP(occupancy 전용)
 
 Phase 09, D111-D120:
   final model integration, losses, metrics, visualization
@@ -1021,23 +1028,25 @@ pytest phases/phase_03_attention_lifting/tests -q
 
 ---
 
-## 7. Phase 04: Deconv and Structured 20cm Head
+## 7. Phase 04: Deconv and 0.3m Occupancy Head (dense 프로토타입)
 
 기간: D036-D050
 
 목표:
 
 ```text
-1.6m feature를 0.4m까지 deconv하고, 20cm dense output을 structured head로 만든다.
+1.2m feature를 0.6m -> 0.3m까지 deconv하고, 0.3m occupancy를 dense 프로토타입으로 만든다.
+(실제 크기에선 0.3m dense가 금지이므로, Phase 08에서 sparse deconv + 2단 게이트 prune으로
+ 전환한다. toy 단계에서는 학습 흐름 이해를 위해 dense 프로토타입을 먼저 만든다.)
 ```
 
-### D036: 1.6m / 0.8m / 0.4m grid 계산
+### D036: 1.2m / 0.6m / 0.3m grid 계산
 
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/src/grid_config.py
-phases/phase_04_deconv_structured_head/tests/test_grid_config.py
+phases/phase_04_deconv_occupancy_head/src/grid_config.py
+phases/phase_04_deconv_occupancy_head/tests/test_grid_config.py
 ```
 
 구현:
@@ -1050,10 +1059,11 @@ def compute_padded_shapes(coarse_shape, num_deconv): ...
 검증:
 
 ```text
-1.6m: 38 x 13 x 4
-0.8m internal: 76 x 26 x 8
-0.4m internal: 152 x 52 x 16
-0.4m valid: 150 x 50 x 13
+range: X 60m(rear10~front50), Y 20m(±10, 내부 20.4m padded), Z 6m(-2~+4)
+1.2m: 50 x 17 x 5   = 4,250
+0.6m: 100 x 34 x 10 = 34,000
+0.3m: 200 x 68 x 20 = 272,000
+(X·Z는 격자=타깃, Y만 0.4m padding -> valid는 Y만 crop)
 ```
 
 ### D037: PanoOcc 발췌 읽기
@@ -1069,7 +1079,8 @@ coarse-to-fine decoder 설명
 
 ```text
 deconv가 하는 일
-왜 0.2m dense feature까지 만들지 않는지
+왜 0.3m dense feature까지 만들지 않는지 (272k voxel -> sparse deconv + prune으로 대체)
+coarse-to-fine + occupancy 프루닝(keep ratio)의 의미
 ```
 
 ### D038: TwoStageVoxelDecoder 구현
@@ -1077,66 +1088,70 @@ deconv가 하는 일
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/src/voxel_decoder.py
-phases/phase_04_deconv_structured_head/tests/test_voxel_decoder.py
+phases/phase_04_deconv_occupancy_head/src/voxel_decoder.py
+phases/phase_04_deconv_occupancy_head/tests/test_voxel_decoder.py
 ```
 
 구현:
 
 ```python
 class TwoStageVoxelDecoder(nn.Module):
-    # 38 x 13 x 4 -> 76 x 26 x 8 -> 152 x 52 x 16
+    # 50 x 17 x 5 -> 100 x 34 x 10 -> 200 x 68 x 20
+    # (toy 단계는 dense 프로토타입. Phase 08에서 2단계째를 sparse deconv + prune으로 교체)
 ```
 
-### D039: valid crop / mask
+### D039: valid crop / mask (Y축만)
 
 수정 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/src/voxel_decoder.py
+phases/phase_04_deconv_occupancy_head/src/voxel_decoder.py
 ```
 
 구현:
 
 ```python
-def crop_valid_04m(feat): ...
+def crop_valid_03m(feat): ...   # X·Z는 격자=타깃, Y만 crop
 ```
 
 검증:
 
 ```text
-152 x 52 x 16 -> 150 x 50 x 13
+200 x 68 x 20 -> Y만 valid crop (X 200, Z 20 그대로)
 ```
 
-### D040: StructuredSubvoxelHead 구현
+### D040: Occupancy Head (0.3m dense 프로토타입)
 
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/src/occupancy_heads.py
-phases/phase_04_deconv_structured_head/tests/test_structured_head.py
+phases/phase_04_deconv_occupancy_head/src/occupancy_heads.py
+phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 ```
 
 구현:
 
 ```python
-class StructuredSubvoxelHead(nn.Module):
-    # B x C x X x Y x Z
-    # -> B x 1 x 2X x 2Y x 2Z
+class OccupancyHead(nn.Module):
+    # 갈래 A: coarse dense @ 0.6m -> occupied/free/unknown/visibility logits
+    # 갈래 B: fine @ 0.3m -> occupied 표면 정밀 logit
+    # toy 단계는 dense 0.3m로 프로토타입 (Phase 08에서 sparse kept voxel 위로 전환)
 ```
 
-### D041: channel reshape 정확성 test
+### D041: 2-갈래 occupancy 정확성 test
 
 수정 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/tests/test_structured_head.py
+phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 ```
 
 검증:
 
 ```text
-8개 channel이 2x2x2 sub-voxel 위치로 정확히 들어가는지 synthetic value로 확인
+갈래 A: 0.6m dense에서 free/unknown/occupied/visibility logit shape
+갈래 B: 0.3m에서 occupied logit shape
+free/unknown은 0.6m, occupied 표면은 0.3m이 책임진다는 분업을 synthetic으로 확인
 ```
 
 ### D042: occupancy head loss 연결
@@ -1144,7 +1159,7 @@ phases/phase_04_deconv_structured_head/tests/test_structured_head.py
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/src/losses.py
+phases/phase_04_deconv_occupancy_head/src/losses.py
 ```
 
 구현:
@@ -1153,20 +1168,21 @@ phases/phase_04_deconv_structured_head/src/losses.py
 def occupancy_loss(logits, target, valid_mask): ...
 ```
 
-### D043: deconv + structured head end-to-end shape
+### D043: deconv + occupancy head end-to-end shape
 
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/tests/test_end_to_end_shape.py
+phases/phase_04_deconv_occupancy_head/tests/test_end_to_end_shape.py
 ```
 
 검증:
 
 ```text
-1.6m feature
--> 0.4m valid feature
--> 20cm logits
+1.2m feature
+-> 0.6m feature
+-> 0.3m valid feature
+-> occupancy logits (갈래 A 0.6m + 갈래 B 0.3m)
 ```
 
 ### D044: tiny training with decoder
@@ -1174,7 +1190,7 @@ phases/phase_04_deconv_structured_head/tests/test_end_to_end_shape.py
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/scripts/train_decoder_toy.py
+phases/phase_04_deconv_occupancy_head/scripts/train_decoder_toy.py
 ```
 
 검증:
@@ -1188,14 +1204,15 @@ one-batch overfit
 수정 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/tests/test_structured_head.py
+phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 ```
 
 검증:
 
 ```text
-StructuredSubvoxelHead가 20cm dense feature tensor를 만들지 않는지 확인
-출력 channel은 logits뿐인지 확인
+toy 프로토타입임을 명시 (실제 크기 0.3m dense는 금지).
+0.6m까지만 dense, 0.3m dense feature volume은 실제 크기에서 만들지 않음을 notes.md에 기록.
+Phase 08에서 sparse deconv + 2단 게이트 prune으로 전환할 지점을 표시.
 ```
 
 ### D046: simple profiler
@@ -1203,15 +1220,15 @@ StructuredSubvoxelHead가 20cm dense feature tensor를 만들지 않는지 확�
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/scripts/profile_structured_head.py
+phases/phase_04_deconv_occupancy_head/scripts/profile_decoder.py
 ```
 
 측정:
 
 ```text
-decoder latency
-structured head latency
-peak memory
+decoder latency (1.2m->0.6m->0.3m)
+occupancy head latency
+peak memory (0.3m dense 프로토타입의 비용 -> sparse 전환 동기 확인)
 ```
 
 ### D047: decoder channel ablation
@@ -1223,18 +1240,19 @@ C=16, 32, 64 latency와 memory 비교
 notes.md에 기록
 ```
 
-### D048: 0.8m attention vs 1.6m attention query count 계산
+### D048: 0.6m attention vs 1.2m attention query count 계산
 
 만들 파일:
 
 ```text
-phases/phase_04_deconv_structured_head/scripts/compute_query_counts.py
+phases/phase_04_deconv_occupancy_head/scripts/compute_query_counts.py
 ```
 
 검증:
 
 ```text
-1.6m query 수와 0.8m query 수 비교 출력
+1.2m query 수(4,250)와 0.6m query 수(34,000) 비교 출력
+-> 왜 attention을 1.2m에서만 하는지 확인
 ```
 
 ### D049: architecture 문서와 구현 비교
@@ -1242,8 +1260,8 @@ phases/phase_04_deconv_structured_head/scripts/compute_query_counts.py
 할 일:
 
 ```text
-occupancy_network_architecture.md의 Section 7, 9와 현재 코드 비교
-빠진 guardrail notes.md에 기록
+occupancy_network_architecture.md의 Section 8(deconv/2단 게이트), 9(4 volume heads)와 현재 코드 비교
+dense 0.3m 프로토타입과 실제 sparse deconv+prune의 차이를 notes.md에 기록
 ```
 
 ### D050: Phase 04 report
@@ -1251,13 +1269,14 @@ occupancy_network_architecture.md의 Section 7, 9와 현재 코드 비교
 검증:
 
 ```bash
-pytest phases/phase_04_deconv_structured_head/tests -q
+pytest phases/phase_04_deconv_occupancy_head/tests -q
 ```
 
 기록:
 
 ```text
-20cm dense output과 20cm dense feature의 차이
+0.3m dense 프로토타입과 (실제) sparse deconv+prune의 차이
+free/unknown은 0.6m coarse, occupied 표면은 0.3m sparse라는 2-해상도 hybrid
 ```
 
 ---
@@ -1269,7 +1288,7 @@ pytest phases/phase_04_deconv_structured_head/tests -q
 목표:
 
 ```text
-multi-camera token packing과 1.6m cross-attention lifting을 single-frame occupancy training에 연결한다.
+multi-camera token packing과 1.2m cross-attention lifting을 single-frame occupancy training에 연결한다.
 ```
 
 ### D051: phase_05 config 작성
@@ -1286,8 +1305,10 @@ phases/phase_05_multicamera_single_frame/configs/tiny.yaml
 num_cameras: 4
 image_size: [128, 256]
 channels: 32
-coarse_shape: [38, 13, 4]
-valid_04m_shape: [150, 50, 13]
+coarse_shape: [50, 17, 5]      # 1.2m
+mid_shape: [100, 34, 10]       # 0.6m (dense, temporal/coarse occ)
+fine_shape: [200, 68, 20]      # 0.3m (toy 프로토타입은 dense, 실제는 sparse)
+# valid는 Y만 crop (X·Z는 격자=타깃)
 ```
 
 ### D052: MultiCameraSyntheticDataset
@@ -1310,7 +1331,7 @@ class MultiCameraSyntheticDataset(Dataset):
 
 ```text
 images: B x N_cam x 3 x H x W
-target: B x 1 x 300 x 100 x 25 또는 tiny shape
+target: B x 1 x 200 x 68 x 20 (0.3m) 또는 tiny shape
 ```
 
 ### D053: camera geometry placeholder
@@ -1363,7 +1384,7 @@ phases/phase_05_multicamera_single_frame/src/lifter.py
 ```python
 class MultiCameraLifter(nn.Module):
     # packed image tokens
-    # 1.6m 3D query
+    # 1.2m 3D query (50 x 17 x 5)
     # vanilla cross-attention
 ```
 
@@ -1380,9 +1401,9 @@ phases/phase_05_multicamera_single_frame/src/model.py
 ```python
 class SingleFrameOccNet(nn.Module):
     image encoder
-    lifter
-    decoder
-    structured occupancy head
+    lifter (1.2m)
+    decoder (1.2m -> 0.6m -> 0.3m)
+    occupancy head (0.6m coarse dense + 0.3m fine; toy는 dense 프로토타입)
 ```
 
 ### D057: shape test
@@ -1530,7 +1551,7 @@ pytest phases/phase_05_multicamera_single_frame/tests -q
 
 ```text
 multi-camera token shape
-1.6m query count
+1.2m query count (4,250)
 single-frame occupancy 결과
 ```
 
@@ -1578,7 +1599,7 @@ def make_z_surface_from_occ(occ): ...
 def make_surface_valid_mask(occ): ...
 ```
 
-### D068: learned z pooling
+### D068: z-flatten (높이를 채널로 보존, ZPool 금지)
 
 만들 파일:
 
@@ -1590,13 +1611,17 @@ phases/phase_06_surface_geometry/tests/test_surface_head.py
 구현:
 
 ```python
-class LearnedZPooling(nn.Module): ...
+class ZFlatten(nn.Module):
+    # B x C x X x Y x Z -> B x (Z*C) x X x Y -> 1x1 conv -> B x Cb x X x Y
+    # 주의: ZPool(평균/최대로 z를 누름) 금지.
+    #   바닥 높이(z_surface)를 예측하는 head가 입력에서 높이 단서를 먼저 버리면 안 됨 (L3).
 ```
 
 검증:
 
 ```text
-B x C x X x Y x Z -> B x Cb x X x Y
+B x C x X x Y x Z -> B x Cb x X x Y (단, 내부적으로 z를 채널로 펼쳐 정보 보존)
+ZPool 대비 z 정보가 head 입력까지 전달되는지 synthetic으로 확인
 ```
 
 ### D069: SurfaceGeometryHead
@@ -1784,26 +1809,65 @@ pytest phases/phase_06_surface_geometry/tests -q
 목표:
 
 ```text
-ViewFormer-style 1.6m BEV memory를 구현하고, dynamic / flow head를 붙인다.
+Tesla/PanoOcc-style 0.6m 3D temporal(z 유지, align+concat+3D residual conv, NOT attention)을
+구현하고, per-voxel flow head(vx,vy,vz)를 붙인다.
+(ViewFormer z-squeeze BEV temporal은 architecture에서 폐기됨 -> 사용하지 않는다.)
 ```
 
-### D081: ViewFormer 발췌 읽기
+### D081: PanoOcc 발췌 읽기 (temporal encoder)
 
 읽을 것:
 
 ```text
-ViewFormer temporal memory
-ego-motion alignment
-occupancy flow 관련 부분
+PanoOcc temporal encoder (temporal align + temporal fuse)
+ego-motion 3D alignment
+Tesla AI Day Temporal Alignment 그림 (Spatial Frame Alignment -> Spatiotemporal Features stack)
 ```
 
 기록:
 
 ```text
-왜 3D memory가 아니라 BEV memory인가?
+왜 BEV z-squeeze가 아니라 3D(z 유지)로 정렬+concat 하는가?
+(높이별 motion / vz를 살리기 위해. attention이 아니라 align+concat+conv)
 ```
 
-### D082: ZPool 구현
+### D081a: 0.6m Pre-temporal Feature Refinement (architecture Section 6)
+
+만들 파일:
+
+```text
+phases/phase_07_temporal_flow/src/pre_temporal.py
+phases/phase_07_temporal_flow/tests/test_pre_temporal.py
+```
+
+구현:
+
+```python
+class PreTemporalRefine3D(nn.Module):
+    # dense deconv(1.2m->0.6m) 직후, temporal 직전에 현재 frame 내부만 한 번 정리
+    # light 3D conv block (depthwise 3x3x3 + pointwise 1x1x1 + residual/gating)
+    # input/output: B x C x 100 x 34 x 10 (shape 유지, z 유지)
+```
+
+왜 필요한가:
+
+```text
+BEVDet4D 교훈: view transformer(1.2m attention) 직후 feature는 너무 coarse해서
+temporal cue를 바로 쓰면 velocity error가 오른다(+11.9%).
+temporal 전에 작은 encoder로 한 번 정리한다 (큰 모듈/추가 camera attention 아님).
+위치: deconv(1.2m->0.6m) 직후, D082~D088 temporal 직전.
+```
+
+검증:
+
+```text
+input/output shape 동일 (B x C x 100 x 34 x 10, z 유지)
+residual이라 초기엔 거의 identity에 가깝다.
+backward 통과, NaN 없음.
+이후 TemporalEnhancer(D088)는 F_0.6_refined를 입력으로 받는다.
+```
+
+### D082: 3D voxel memory align (z 유지, no z-squeeze)
 
 만들 파일:
 
@@ -1815,16 +1879,17 @@ phases/phase_07_temporal_flow/tests/test_temporal_memory.py
 구현:
 
 ```python
-class ZPool(nn.Module): ...
+# ZPool/z-squeeze 없음. 0.6m 3D feature(z 유지)를 그대로 다룬다.
+def stack_history_3d(current, aligned_history): ...   # 채널 방향 concat 준비
 ```
 
 검증:
 
 ```text
-B x C x X x Y x Z -> B x Cb x X x Y
+B x C x X x Y x Z 가 z를 유지한 채 다뤄지는지 확인 (BEV로 누르지 않음)
 ```
 
-### D083: BEV ego-motion warp
+### D083: 3D ego-motion warp
 
 수정 파일:
 
@@ -1835,80 +1900,85 @@ phases/phase_07_temporal_flow/src/temporal_memory.py
 구현:
 
 ```python
-def warp_bev_feature(bev, pose_delta): ...
+def warp_3d_feature(feat_3d, pose_delta): ...   # grid_sample 3D, ego-motion 정렬
 ```
 
 검증:
 
 ```text
 identity pose면 output 동일
-translation pose면 feature 이동
+translation pose면 3D feature가 이동
 ```
 
-### D084: memory queue
+### D084: 3D memory queue
 
 구현:
 
 ```python
-class BEVMemoryQueue:
-    push(feature, pose)
+class VoxelMemoryQueue:
+    push(feature_3d, pose)
     get_aligned(current_pose)
 ```
 
 검증:
 
 ```text
-N_history=3 유지
+N_history=3 (현재 포함 4 frame, PanoOcc와 동일) 유지
 ```
 
 설계 주의:
 
 ```text
-architecture 문서 기준 memory는 0.8m BEV로 저장/warp하고,
-keyframe은 ~0.2s 시간 간격으로 띄엄띄엄 저장한다.
-toy 단계에서는 grid가 작으므로 동일 해상도로 시작해도 되지만,
-queue 인터페이스에 (저장 해상도, keyframe 간격) 설정을 열어둔다.
+architecture 문서 기준 memory는 0.6m 3D voxel(z 유지)로 저장/warp하고,
+keyframe은 ~0.2s 시간 간격으로 띄엄띄엄 저장한다(0.6~0.8s 창).
+queue 인터페이스에 (저장 해상도 0.6m, keyframe 간격, 1.2m fallback) 설정을 열어둔다.
 ```
 
-### D085: temporal fusion simple
+### D085: temporal fusion (concat + 3D residual conv)
 
 구현:
 
 ```python
-class TemporalFusion(nn.Module):
-    # current BEV + aligned memory
-    # simple mean / gated fusion
+class TemporalFusion3D(nn.Module):
+    # X = concat(current_3d, aligned_history_3d)   # 채널 stack
+    # out = current + Residual3DConv(X)            # attention 아님
 ```
 
 목표:
 
 ```text
-처음에는 attention보다 simple fusion으로 시작
+Tesla/PanoOcc식 align + concat + 3D residual conv로 융합한다.
+(temporal attention / z-squeeze 금지)
 ```
 
-### D086: temporal attention
+### D086: streaming memory option (학습 효율)
 
 수정:
 
 ```text
-TemporalFusion에 attention option 추가
+TemporalFusion3D에 ViewFormer streaming memory option 추가
+(학습 시 과거 feature를 재계산하지 않고 캐시 -> 학습 효율, 추론 latency 변화 없음)
 ```
 
 검증:
 
 ```text
-output shape 유지
+output shape 유지, streaming on/off 결과 동일성 확인
 ```
 
-### D087: Inject3D
+### D087: 1.2m fallback 스위치 + 융합 마무리
 
 구현:
 
 ```python
-class InjectBEVTo3D(nn.Module):
-    # BEV temporal context broadcast to Z
-    # z embedding
-    # residual add
+# 융합 해상도 스위치: 기본 0.6m 3D, Orin 예산 초과 시 1.2m 3D fallback
+# (3D 유지는 동일, 해상도만 한 단계 내림)
+```
+
+검증:
+
+```text
+0.6m / 1.2m 두 해상도에서 fusion forward 동작
 ```
 
 ### D088: temporal model integration
@@ -1922,9 +1992,9 @@ phases/phase_07_temporal_flow/src/model_temporal.py
 구현:
 
 ```text
-1.6m feature
--> temporal BEV memory
--> enhanced 1.6m feature
+0.6m 3D feature (z 유지)
+-> 3D voxel memory align + concat + 3D residual conv
+-> enhanced 0.6m 3D feature
 -> decoder
 ```
 
@@ -1957,8 +2027,9 @@ phases/phase_07_temporal_flow/tests/test_flow_head.py
 
 ```python
 class DynamicFlowHead(nn.Module):
-    # dynamic logit
-    # flow dx, dy, dz
+    # per-voxel: dynamic logit
+    # per-voxel 3D flow: vx, vy, vz   (motion은 0.6m 3D temporal에서, 0.3m로 broadcast)
+    # z 유지 덕에 vz(수직 속도)까지 산출 가능
 ```
 
 ### D091: flow loss
@@ -2010,14 +2081,14 @@ BEV arrow plot 저장
 
 ```text
 no temporal
-simple temporal mean
-temporal attention
+3D concat + residual conv (채택)
++ streaming memory option
 ```
 
 기록:
 
 ```text
-loss / IoU / flow error 비교
+loss / IoU / flow error 비교 (특히 vz가 살아나는지)
 ```
 
 ### D095: Phase 07 report
@@ -2031,31 +2102,77 @@ pytest phases/phase_07_temporal_flow/tests -q
 기록:
 
 ```text
-BEV memory shape
-flow head mask
+3D voxel memory shape (z 유지)
+per-voxel flow (vx,vy,vz) head mask
 가장 어려운 점
 ```
 
 ---
 
-## 11. Phase 08: Dynamic-resolution Refinement
+## 11. Phase 08: Sparse Deconv + 2단 게이트 Prune + Queryable
 
 기간: D096-D110
 
 목표:
 
 ```text
-Active Mask + quota Top-K + sparse local anchor + packed Queryable MLP를 구현한다.
+0.6m -> 0.3m을 sparse deconv + 2단 게이트 prune(gate① 0.6m parent + gate② 0.3m child)으로
+만들고, near-surface free shell(L2)을 함께 keep한다.
+그 위에 exposed-face mask / quota keep / sparse anchor / packed Queryable MLP(occupancy 전용)를
+붙인다. (Phase 04의 dense 0.3m 프로토타입을 이 sparse 경로로 교체)
 ```
 
-### D096: active score components
+### D096: sparse deconv + gate① (0.6m parent gate, 연산량)
 
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/src/active_mask.py
-phases/phase_08_dynamic_resolution_refinement/tests/test_active_mask.py
+phases/phase_08_sparse_prune_queryable/src/sparse_decoder.py
+phases/phase_08_sparse_prune_queryable/tests/test_sparse_decoder.py
 ```
+
+구현:
+
+```python
+def parent_gate_06m(coarse_occ_logits, threshold): ...
+    # coarse occupancy로 occupied/boundary parent만 남김
+    # free/unknown parent의 0.3m children은 "생성조차 안 함" (272k materialize 회피)
+class SparseVoxelDeconv(nn.Module): ...   # 남은 parent만 0.3m로 sparse 업샘플
+```
+
+검증:
+
+```text
+free/unknown parent는 0.3m child를 만들지 않는지 확인
+occupied/boundary parent만 확장되는지 확인
+```
+
+### D097: gate② (0.3m child prune, 선명도) + near-surface free shell (L2)
+
+수정 파일:
+
+```text
+phases/phase_08_sparse_prune_queryable/src/sparse_decoder.py
+```
+
+구현:
+
+```python
+def child_prune_03m(child_occ_logits, keep_ratio=0.5): ...
+    # 확장된 child 중 빈 child 제거 -> 표면 또렷 (anti-dilation)
+def add_near_surface_free_shell(kept, occ_flag): ...
+    # 표면 인접 free child 1겹을 함께 keep (기본 ON, L2). config flag로 off 가능
+```
+
+검증:
+
+```text
+빈 child가 제거되어 표면이 얇게 유지되는지 (anti-dilation)
+표면 인접 free 1겹이 keep되는지 (좁은 통로 통과 판단용)
+kept = occupied 표면 + near-surface free shell 임을 확인 (occupied/free flag 구분)
+```
+
+### D098: prune keep + query priority score 통합
 
 구현:
 
@@ -2063,50 +2180,32 @@ phases/phase_08_dynamic_resolution_refinement/tests/test_active_mask.py
 def boundary_score(occ_logits): ...
 def uncertainty_score(occ_logits): ...
 def dynamic_score(dynamic_logits): ...
-```
-
-### D097: surface / planner / near score
-
-수정 파일:
-
-```text
-phases/phase_08_dynamic_resolution_refinement/src/active_mask.py
-```
-
-구현:
-
-```python
 def near_field_score(voxel_centers): ...
 def planner_corridor_score(voxel_centers, trajectory): ...
-def surface_score(z_surface, valid): ...
-```
-
-### D098: S_refine 통합
-
-구현:
-
-```python
-def compute_refine_score(...): ...
+def compute_keep_priority(...): ...   # gate② keep 우선순위 + 이후 query budget 공용
 ```
 
 검증:
 
 ```text
-boundary / uncertainty / planner 영역 score가 높음
+boundary / uncertainty / dynamic / planner 영역 score가 높음
+far-field는 keep을 더 높여 원거리 물체 보호 (프루닝 비가역, recall 우선)
 ```
 
-### D099: quota_topk
+### D099: quota 기반 keep (v1.5)
 
 구현:
 
 ```python
-def quota_topk(category_scores, quotas): ...
+def quota_keep(category_scores, quotas): ...
+    # 단순 top-k가 얇은 물체/원거리/저신뢰 occupied를 먼저 자르는 문제 보호
 ```
 
 검증:
 
 ```text
 quota별 selected count 확인
+near/far/dynamic/planner/thin 카테고리별 최소 keep 보장
 중복 제거 확인
 ```
 
@@ -2125,18 +2224,111 @@ near/planner/dynamic은 M_i가 큼
 far/static은 M_i가 작음
 ```
 
-### D101: exposed face mask
+### D101: exposed face mask (kept AND occupied 기준, N1)
 
 구현:
 
 ```python
-def compute_exposed_faces(occ_binary): ...
+def compute_exposed_faces(kept_idx, occ_flag, coarse_occ): ...
+    # neighbor가 kept AND occupied -> not exposed (occupied 표면끼리 맞닿음)
+    # neighbor가 kept free shell    -> exposed-to-free (fine 확정 노출면)
+    # neighbor가 pruned             -> 부모 0.6m coarse로 free/unknown/occupied 구분
 ```
 
 검증:
 
 ```text
+표면이 near-surface free shell과 맞닿는 면이 exposed로 잡히는지 (N1: kept != occupied 주의)
+pruned neighbor는 부모 coarse occupancy로 판정되는지
 free/unknown neighbor 방향이 exposed인지 확인
+```
+
+### D101a: Sub-Voxel Shape Information Head (architecture Section 9.3)
+
+만들 파일:
+
+```text
+phases/phase_08_sparse_prune_queryable/src/subvoxel_shape_head.py
+phases/phase_08_sparse_prune_queryable/tests/test_subvoxel_shape_head.py
+```
+
+구현:
+
+```python
+class SubVoxelShapeHead(nn.Module):
+    # input:  F_0.3_sparse kept (occupied 표면) voxel feature + exposed_face_mask(D101)
+    # output (per kept occupied voxel):
+    #   exposed_face_logits: 6
+    #   face_surface_offset: 6   (각 exposed face -> voxel 내부 surface까지 normalized [0,1])
+    #   local_normal: 3
+    #   shape_uncertainty: 1
+    #   thinness_logit: 1
+    #   shape_code: Cs (예: 8 or 16)   # Queryable MLP / anchor가 소비
+```
+
+face-aware execution (head 내부 동작):
+
+```text
+zero exposed face(내부) -> heavy local query 생략
+1 face -> 그 normal 방향만 offset/boundary query
+2 face -> edge, 3+ face -> corner/thin 후보(budget 증가)
+모든 voxel을 같은 비용으로 query하지 않는다 (priority mask 사용).
+```
+
+검증:
+
+```text
+출력이 kept occupied voxel 위에서만 계산된다 (free shell/pruned 제외).
+shape_code가 D104 anchor / D105 QueryableMLP 입력으로 전달된다.
+offset이 [0,1](또는 [-0.5,0.5]) 범위, normal이 단위 vector에 가깝다.
+exposed face 없는 interior voxel은 query budget이 0에 가깝다.
+```
+
+기록:
+
+```text
+notes.md에 "Sub-Voxel Shape는 후처리가 아니라 4 volume head 중 하나"임을 적는다.
+exposed-face mask(D101)는 이 head의 '실행 방식'이지 별도 head가 아니다.
+```
+
+### D101b: 3D Semantics Head (architecture Section 9.4)
+
+만들 파일:
+
+```text
+phases/phase_08_sparse_prune_queryable/src/semantics_head.py
+phases/phase_08_sparse_prune_queryable/tests/test_semantics_head.py
+```
+
+구현:
+
+```python
+class SemanticsHead(nn.Module):
+    # input:  F_0.3_sparse kept (occupied 표면) voxel feature
+    # output: [N_kept] x N_class   (sparse, kept voxel별 semantic logit)
+```
+
+권장 class (실내+실외 비도로):
+
+```text
+ground/floor, wall/building, vehicle, pedestrian, cyclist,
+curb/barrier, vegetation, other static
+(free/unknown은 Occupancy Head 담당 -> semantics에서 제외/ignore)
+```
+
+검증:
+
+```text
+semantic은 occupied/surface-near voxel 위에서만 계산/loss 적용.
+free/unknown 영역에 semantic을 강제하지 않는다 (noisy supervision 방지).
+출력 shape [N_kept] x N_class, NaN 없음.
+Queryable은 occupancy 전용이므로 semantic 질의는 이 voxel-level head에서만 제공(N7-B).
+```
+
+기록:
+
+```text
+notes.md에 "Queryable MLP에는 semantic을 넣지 않고 이 head에서만 제공"(Tesla 2-MLP 중 occupancy만 채택)을 적는다.
 ```
 
 ### D102: adaptive query generation
@@ -2144,7 +2336,7 @@ free/unknown neighbor 방향이 exposed인지 확인
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/src/query_generation.py
+phases/phase_08_sparse_prune_queryable/src/query_generation.py
 ```
 
 구현:
@@ -2173,29 +2365,32 @@ query_offsets: K + 1
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/src/sparse_anchor.py
+phases/phase_08_sparse_prune_queryable/src/sparse_anchor.py
 ```
 
 구현:
 
 ```python
-def gather_04m_features(feat, selected_idx): ...
+def gather_03m_features(feat, selected_idx): ...   # F_0.3_sparse kept voxel feature
 class SparseLocalAnchor(nn.Module): ...
 ```
 
-### D105: QueryableMLP
+### D105: QueryableMLP (occupancy 전용)
 
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/src/queryable_mlp.py
+phases/phase_08_sparse_prune_queryable/src/queryable_mlp.py
 ```
 
 구현:
 
 ```python
 class QueryableMLP(nn.Module):
-    # F_query + q_local + PE + coarse logits
+    # F_query(F_0.3_sparse) + q_local + PE + coarse logits
+    # 출력: continuous occupancy / uncertainty (occupancy 전용)
+    # semantic은 voxel-level 3D Semantics Head에서만 (Tesla 2-MLP 중 occupancy MLP만 채택)
+    # pruned 영역 query는 부모 0.6m coarse occupancy로 보수적 즉답 (MLP 생략)
 ```
 
 ### D106: packed execution test
@@ -2203,7 +2398,7 @@ class QueryableMLP(nn.Module):
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/tests/test_queryable_mlp.py
+phases/phase_08_sparse_prune_queryable/tests/test_queryable_mlp.py
 ```
 
 검증:
@@ -2212,7 +2407,8 @@ phases/phase_08_dynamic_resolution_refinement/tests/test_queryable_mlp.py
 K=32
 variable M_i
 Q=sum(M_i)
-MLP output Q x 1
+MLP output Q x 1 (occupancy)
+pruned 영역은 coarse 즉답 경로로 빠지는지 확인
 ```
 
 ### D107: boundary search
@@ -2220,7 +2416,7 @@ MLP output Q x 1
 수정 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/src/query_generation.py
+phases/phase_08_sparse_prune_queryable/src/query_generation.py
 ```
 
 구현:
@@ -2235,24 +2431,26 @@ def refine_boundary_bisection(...): ...
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/src/fine_overlay.py
+phases/phase_08_sparse_prune_queryable/src/fine_overlay.py
 ```
 
 구현:
 
 ```python
-class FineOverlay:
-    # selected voxel idx
-    # local cuboids / local boundary samples
+class SparseSurfaceRepresentation:
+    # kept voxel idx (occupied 표면 + near-surface free shell)
+    # F_0.3_sparse feature + Sub-Voxel Shape code / offset / normal
+    # local boundary samples
 ```
 
 설계 주의:
 
 ```text
-FineOverlay는 "selected voxel -> 파라미터 집합 -> 임의 점 평가"
-인터페이스로 추상화한다.
-이후 architecture 문서의 budget-K Gaussian refinement branch로
-구현체만 교체할 수 있게 한다.
+이것은 architecture 문서의 최종 30cm 표현(sparse deconv + 2단 게이트 prune +
+near-surface free shell) 위에 올라가는 sparse surface representation이다.
+"selected voxel -> local context(shape code/offset) -> 임의 점 occupancy 평가"
+인터페이스로 추상화해, Queryable MLP / Sub-Voxel Shape Head가 공유하도록 한다.
+(Gaussian refinement는 현재 architecture에 없다 -> 도입하지 않는다.)
 ```
 
 ### D109: refinement toy training
@@ -2260,7 +2458,7 @@ FineOverlay는 "selected voxel -> 파라미터 집합 -> 임의 점 평가"
 만들 파일:
 
 ```text
-phases/phase_08_dynamic_resolution_refinement/scripts/train_refinement_toy.py
+phases/phase_08_sparse_prune_queryable/scripts/train_refinement_toy.py
 ```
 
 검증:
@@ -2274,15 +2472,18 @@ selected boundary voxel 내부 query loss 감소
 검증:
 
 ```bash
-pytest phases/phase_08_dynamic_resolution_refinement/tests -q
+pytest phases/phase_08_sparse_prune_queryable/tests -q
 ```
 
 기록:
 
 ```text
-K_total
-Q_total
+2단 게이트(parent/child) + near-surface free shell 동작
+Sub-Voxel Shape Head(D101a) 출력(offset/normal/shape_code/thinness)
+3D Semantics Head(D101b) 출력
+K_total / Q_total
 packed MLP latency
+이로써 4 volume head(Occupancy/Flow/Sub-Voxel Shape/3D Semantics)가 모두 구현됨
 ```
 
 ---
@@ -2328,12 +2529,18 @@ final_occnet_v1/src/occnet_v1/model.py
 class OccNetV1(nn.Module):
     def forward(batch):
         return {
-          "occ_logits": ...,
-          "surface": ...,
+          "occ_coarse": ...,   # 0.6m free/unknown/occupied/visibility
+          "occ_fine": ...,     # 0.3m sparse kept (occupied 표면)
+          "surface": ...,      # z-flatten
           "dynamic": ...,
-          "flow": ...,
-          "refine": ...
+          "flow": ...,         # vx,vy,vz
+          "subvoxel_shape": ...,  # offset/normal/shape_code/thinness (D101a)
+          "semantics": ...,    # voxel-level (D101b)
+          "queryable": ...,    # occupancy 전용
         }
+# forward 내부 순서: ... -> dense deconv 1.2->0.6 -> pre-temporal refine(D081a)
+#  -> 0.6m 3D temporal + flow -> coarse occ -> sparse deconv+2단 게이트(+free shell)
+#  -> occupancy fine / subvoxel shape / semantics / surface heads -> queryable
 ```
 
 ### D113: final shape test
@@ -2473,15 +2680,19 @@ final_occnet_v1/scripts/profile_runtime.py
 
 ```text
 backbone
-attention
-temporal
-deconv
-structured head
-surface head
-flow head
-active mask
-Top-K
-packed Queryable MLP
+attention (1.2m)
+pre-temporal refine (0.6m, D081a)
+temporal (0.6m 3D)
+dense deconv (1.2m->0.6m)
+sparse deconv + 2단 게이트 prune (0.6m->0.3m)
+occupancy head (coarse dense + sparse fine)
+sub-voxel shape head (D101a)
+3D semantics head (D101b)
+surface head (z-flatten)
+flow head (vx,vy,vz)
+active/exposed-face mask
+quota keep
+packed Queryable MLP (occupancy 전용)
 ```
 
 ### D122: K/Q latency table
@@ -2550,7 +2761,8 @@ final_occnet_v1/scripts/export_onnx.py
 목표:
 
 ```text
-전체가 안 되면 backbone + structured head 일부라도 export
+전체가 안 되면 backbone + dense 부분(1.2m->0.6m + occupancy head) 일부라도 export
+(sparse deconv는 TensorRT 네이티브 지원이 약하므로 dense 경로부터 export)
 ```
 
 ### D128: final README
@@ -2600,12 +2812,19 @@ phases/phase_10_runtime_final_report/reports/next_3_months.md
 후보:
 
 ```text
-TensorRT FP16
-budget-K Gaussian refinement branch 교체 실험
-  - GaussianFormer-2-style probabilistic superposition 평가
-  - deformable image re-query (P3, 1 round)
-  - Phase 08 packed Queryable MLP refinement와 ablation 비교
+TensorRT FP16 + sparse conv 배포 최적화
+  - sparse 3D conv(spconv/torchsparse)의 Orin 커스텀 커널/플러그인
+  - 막히면 0.3m masked dense(ROI/frustum crop) fallback (architecture Section 8.4/13)
+  - INT8 검토 (v1.5)
+temporal v1.5 강화 (architecture Section 7)
+  - 장기 누적 기억(Tesla Temporal Context, GRU/EMA식) 추가
+  - 0.3m residual flow head (full 0.3m temporal은 계속 금지)
+prune v1.5 강화 (architecture Section 8.2)
+  - 카테고리별 quota keep, near-surface free shell 튜닝
+deformable image re-query (P3, 1 round) 실험 (선택)
 flow-aware dynamic feature correction
+(선택 연구) Gaussian refinement (GaussianFormer 계열)
+  - 현재 architecture에는 없음. Phase 08 packed Queryable MLP와 ablation 비교용 연구 트랙
 camera-only GT auto-labeling pipeline (architecture 문서 Section 19)
   - Stage A: MapAnything / MASt3R 기반 metric 재구성
     (vanilla DUSt3R 직접 사용 금지: scale 모호 / pair 단위 추론 /
@@ -2666,11 +2885,15 @@ AI에게 요청할 때는 항상 다음 형식을 쓴다.
 예시:
 
 ```text
-phases/phase_04_deconv_structured_head/src/occupancy_heads.py에 StructuredSubvoxelHead를 만들어줘.
-입력은 B x C x X x Y x Z이고 출력은 B x 1 x 2X x 2Y x 2Z야.
-20cm dense feature volume은 만들면 안 돼.
-Conv3d 1x1로 8개 sub-voxel logit channel을 만든 뒤 reshape해야 해.
-tests/test_structured_head.py도 작성해줘.
+phases/phase_08_sparse_prune_queryable/src/sparse_decoder.py에
+sparse deconv + 2단 게이트 prune을 만들어줘.
+입력은 0.6m coarse occupancy logits(B x 1 x 100 x 34 x 10)와 0.6m feature야.
+게이트①: free/unknown parent의 0.3m children을 생성하지 마(272k materialize 금지).
+게이트②: 확장된 child 중 빈 child를 keep ratio ~0.5로 prune하고,
+         표면 인접 free child 1겹은 함께 keep해(near-surface free shell, L2).
+출력은 kept voxel index + F_0.3_sparse feature야.
+dense 0.3m feature volume은 만들면 안 돼.
+tests/test_sparse_decoder.py도 작성해줘.
 ```
 
 ---
@@ -2682,13 +2905,15 @@ D023:
   REO Abstract + Method overview
 
 D037:
-  PanoOcc architecture + coarse-to-fine decoder
+  PanoOcc architecture + coarse-to-fine sparse decoder + occupancy 프루닝
 
 D066:
   RoadBEV problem definition + road elevation output
 
 D081:
-  ViewFormer temporal memory + occupancy flow
+  PanoOcc temporal encoder (align+concat+3D conv, z 유지)
+  + Tesla AI Day Temporal Alignment 그림
+  (ViewFormer는 streaming memory / flow supervision만 참고)
 ```
 
 논문을 읽을 때는 다음만 먼저 본다.

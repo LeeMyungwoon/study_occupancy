@@ -21,7 +21,7 @@ v1에서 slope, normal, step은 별도 neural head로 만들지 않는다.
 
 ```text
 1. 3D occupancy target에서 2D surface height target을 만들 수 있다.
-2. 0.4m 또는 1.6m 3D feature에서 BEV surface map을 예측할 수 있다.
+2. 0.6m 3D feature(F_0.6)에서 BEV surface map을 예측할 수 있다 (z-flatten, ZPool 금지).
 3. flat / ramp / curb / stair toy scene에서 z_surface, valid, step score를 볼 수 있다.
 4. occupancy loss와 surface loss를 같이 학습해도 NaN 없이 loss가 감소한다.
 5. surface uncertainty를 active mask/refinement 후보로 넘길 수 있다.
@@ -48,7 +48,7 @@ phases/phase_06_surface_geometry/notes.md
 
 ```text
 1. occupancy volume과 surface height map은 무엇이 다른가?
-2. 왜 surface는 300 x 100 x 25가 아니라 300 x 100 BEV output인가?
+2. 왜 surface는 3D volume(예: 100 x 34 x 10)이 아니라 BEV(100 x 34) output인가?
 3. "차 있음/비어 있음"과 "이 위치의 바닥 높이"는 어떤 경우에 다르게 동작하는가?
 4. 계단, 연석, 경사로는 occupancy에서는 어떻게 보이고 surface에서는 어떻게 보이는가?
 5. v1에서 road semantics를 별도 class로 예측하지 않고 geometry 중심으로 시작하는 이유는 무엇인가?
@@ -112,7 +112,7 @@ single pillar scene에서는 pillar column에만 valid가 True가 된다.
 이번 toy 구현은 surface head와 loss를 이해하기 위한 최소 label generator다.
 ```
 
-## D068 - learned z pooling
+## D068 - z-flatten (높이를 채널로 보존, ZPool 금지)
 
 만들 파일:
 
@@ -124,39 +124,42 @@ phases/phase_06_surface_geometry/tests/test_surface_head.py
 구현:
 
 ```python
-class LearnedZPooling(nn.Module):
+class ZFlatten(nn.Module):
     """
     입력:  B x C x X x Y x Z
     출력:  B x Cb x X x Y
 
-    Z축 정보를 단순 max/mean으로 없애지 않고,
-    작은 attention 또는 1x1x1 conv 기반 가중합으로 BEV feature를 만든다.
+    Z축을 채널로 펼친다 (z-flatten): B x C x X x Y x Z -> B x (Z*C) x X x Y
+    -> 1x1 conv로 (Z*C) -> Cb 압축.
+
+    주의: ZPool(평균/최대/softmax 가중합으로 z를 '누르는' 방식) 금지.
+      바닥 높이(z_surface)를 예측하는 head가 입력에서 높이 단서를 먼저 버리면 안 된다 (L3).
     """
 ```
 
 최소 구현:
 
 ```text
-1. Conv3d로 channel을 줄인다.
-2. Z축 score를 만든다.
-3. softmax(score, dim=Z)로 z weight를 만든다.
-4. feature * weight를 Z축으로 sum한다.
+1. B x C x X x Y x Z -> permute/reshape -> B x (Z*C) x X x Y (z를 채널로)
+2. 1x1 conv로 (Z*C) -> Cb 압축
+3. (pooling으로 z를 합치지 않는다 - 높이 분포 정보를 보존한 채 BEV로 내린다)
 ```
 
 검증:
 
 ```text
-입력 shape:  B=2, C=32, X=38, Y=13, Z=4
-출력 shape:  B=2, Cb=32, X=38, Y=13
-Z dimension이 사라진다.
+입력 shape:  B=2, C=32, X=100, Y=34, Z=10
+중간:        B=2, (Z*C)=320, X=100, Y=34
+출력 shape:  B=2, Cb=32, X=100, Y=34
+ZPool 대비 z 정보가 head 입력까지 전달되는지 synthetic value로 확인.
 gradient backward가 통과한다.
 ```
 
 기록:
 
 ```text
-notes.md에 max pooling, mean pooling, learned pooling의 차이를 적는다.
-learned pooling은 surface 위치를 찾는 데 더 유리할 수 있지만, 완전히 공짜는 아니다.
+notes.md에 ZPool(누르기)과 z-flatten(채널로 펼치기)의 차이를 적는다.
+"바닥 높이를 예측하는데 높이축을 먼저 누르면 정답 단서를 버리는 셈"(L3)을 설명할 수 있어야 한다.
 ```
 
 ## D069 - SurfaceGeometryHead
@@ -183,7 +186,7 @@ class SurfaceGeometryHead(nn.Module):
 구현 순서:
 
 ```text
-1. LearnedZPooling으로 3D feature를 BEV feature로 바꾼다.
+1. ZFlatten(z-flatten)으로 3D feature를 BEV feature로 바꾼다 (ZPool 금지, L3).
 2. 2D Conv block 2개 정도로 BEV context를 섞는다.
 3. z_surface head, valid_logit head, uncertainty_raw head를 분리한다.
 4. uncertainty에는 아직 softplus를 적용하지 않아도 된다. D078에서 정리한다.
@@ -201,8 +204,9 @@ uncertainty: B x 1 x X x Y
 실패 체크:
 
 ```text
-Z축을 flatten해서 X,Y와 섞어버리지 않는다.
+z-flatten은 Z를 "채널"로 옮기는 것이다 (X,Y 공간축과 섞지 않는다).
 surface는 BEV output이므로 최종 출력에 Z dimension이 남으면 안 된다.
+단, z 정보는 채널로 보존된 채 head에 들어가야 한다 (ZPool로 누르지 않기, L3).
 ```
 
 ## D070 - surface losses
@@ -338,12 +342,12 @@ phases/phase_06_surface_geometry/tests/test_surface_derived.py
 구현:
 
 ```python
-def compute_slope_from_z(z_surface, dx=0.4, dy=0.4):
+def compute_slope_from_z(z_surface, dx=0.6, dy=0.6):
     """
-    z_surface의 x/y 방향 차분으로 slope magnitude를 계산한다.
+    z_surface의 x/y 방향 차분으로 slope magnitude를 계산한다 (BEV 격자 0.6m).
     """
 
-def compute_normal_from_z(z_surface, dx=0.4, dy=0.4):
+def compute_normal_from_z(z_surface, dx=0.6, dy=0.6):
     """
     height field의 normal vector를 근사한다.
     """

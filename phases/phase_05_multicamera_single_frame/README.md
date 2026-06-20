@@ -1,7 +1,7 @@
 # Phase 05 - Multi-camera Single-frame Occupancy
 
 기간: D051-D065  
-목표: multi-camera image tokens, canonical ray PE, 1.6m 3D query attention, 3D decoder, structured occupancy head를 하나의 single-frame 모델로 연결한다.
+목표: multi-camera image tokens, canonical ray PE, 1.2m 3D query attention, 3D decoder(1.2m->0.6m->0.3m), occupancy head(2-갈래, dense 프로토타입)를 하나의 single-frame 모델로 연결한다.
 
 ## D051 - tiny config 작성
 
@@ -17,9 +17,10 @@ phases/phase_05_multicamera_single_frame/configs/tiny.yaml
 num_cameras: 4
 image_size: [128, 256]
 channels: 32
-coarse_shape: [38, 13, 4]
-valid_04m_shape: [150, 50, 13]
-target_shape: [300, 100, 25]
+coarse_shape: [50, 17, 5]      # 1.2m
+mid_shape: [100, 34, 10]       # 0.6m (dense, temporal/coarse occ)
+fine_shape: [200, 68, 20]      # 0.3m (toy 프로토타입은 dense, 실제는 sparse)
+# valid는 Y만 crop (X·Z는 격자=타깃)
 ```
 
 검증:
@@ -114,9 +115,9 @@ phases/phase_05_multicamera_single_frame/src/lifter.py
 ```python
 class MultiCameraLifter(nn.Module):
     # packed image tokens
-    # 1.6m 3D query
+    # 1.2m 3D query (50 x 17 x 5)
     # vanilla cross-attention
-    # output: B x C x 38 x 13 x 4
+    # output: B x C x 50 x 17 x 5
 ```
 
 검증:
@@ -138,9 +139,9 @@ phases/phase_05_multicamera_single_frame/src/model.py
 ```python
 class SingleFrameOccNet(nn.Module):
     image_encoder
-    lifter
-    two_stage_decoder
-    structured_occupancy_head
+    lifter                 # 1.2m
+    two_stage_decoder      # 1.2m -> 0.6m -> 0.3m
+    occupancy_head         # 0.6m coarse dense + 0.3m fine (toy는 dense 프로토타입)
 ```
 
 출력:

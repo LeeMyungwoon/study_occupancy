@@ -266,7 +266,7 @@ Nk가 camera 수와 image feature 해상도에 따라 어떻게 커지는지 기
 이해:
 
 ```text
-왜 spatial attention을 1.6m coarse grid에서 해야 하는가?
+왜 spatial attention을 1.2m coarse grid에서 해야 하는가?
 ```
 
 ## D032 - attention map visualization
