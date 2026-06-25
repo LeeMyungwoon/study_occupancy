@@ -150,41 +150,36 @@ keep priority는 최종 occupancy가 아니다.
 "어떤 표면 voxel을 살릴지 + 어디를 더 자세히 query할지"를 정하는 score다.
 ```
 
-## D099 - quota 기반 keep (v1.5)
+## D099 - Pruning false-negative 방어 (v1 필수, architecture Section 8.2.1)
+
+**프루닝 false negative가 가장 위험한 실패 모드다.** coarse(게이트①)가 얇은 물체를 free로 오판하면 0.3m에서 복구 불가(비가역). 충돌 안전에 직결되므로 v1.5가 아니라 **v1부터 전부** 넣는다.
 
 수정 파일:
 
 ```text
 phases/phase_08_sparse_prune_queryable/src/active_mask.py
-phases/phase_08_sparse_prune_queryable/tests/test_quota_keep.py
+phases/phase_08_sparse_prune_queryable/src/sparse_decoder.py
+phases/phase_08_sparse_prune_queryable/tests/test_prune_recall.py
 ```
 
-구현:
+구현 (v1 필수, 5가지):
 
 ```python
-def quota_keep(category_scores, quotas, total_budget):
-    """
-    category별 quota만큼 keep. 중복 제거. total_budget clamp.
-    단순 top-k가 얇은 물체/원거리/저신뢰 occupied를 먼저 자르는 문제를 보호.
-    """
-```
-
-기본 quota 예:
-
-```text
-near-field occupied
-far-field low-confidence
-dynamic
-planner corridor
-thin-object / high-gradient
-random exploration
+# 1. recall-first gate: 게이트① 임계값을 recall 기준 (occupied 놓침 << free 더 keep)
+# 2. uncertainty keep: coarse p~0.5 / unknown / 저신뢰 parent는 무조건 keep
+def quota_keep(category_scores, quotas, total_budget): ...
+#    3. category quota: near/far-lowconf/dynamic/planner/thin/random 최소 keep 보장
+# 4. GT-guided warmup: 학습 초기 GT occupied parent 강제 keep -> 점진 전환
+# 5. soft / straight-through top-k: hard top-k는 gradient 없음 -> keep에 gradient 흘림
 ```
 
 검증:
 
 ```text
-category별 selected count가 quota를 넘지 않는다.
-near/far/dynamic/planner/thin 카테고리별 최소 keep이 보장된다.
+prune_recall (GT occupied가 살아남은 비율)을 측정한다 (핵심 지표).
+얇은 물체 toy(난간/막대)에서 coarse가 약해도 recall이 유지되는지 확인.
+category별 selected count가 quota를 넘지 않고, 카테고리별 최소 keep이 보장된다.
+soft/straight-through top-k로 gate에 gradient가 흐른다.
 중복 voxel이 여러 category에 있어도 최종 index는 unique이다.
 ```
 

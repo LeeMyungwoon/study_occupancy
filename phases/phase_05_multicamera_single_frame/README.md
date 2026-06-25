@@ -20,7 +20,7 @@ channels: 32
 coarse_shape: [50, 17, 5]      # 1.2m
 mid_shape: [100, 34, 10]       # 0.6m (dense, temporal/coarse occ)
 fine_shape: [200, 68, 20]      # 0.3m (toy 프로토타입은 dense, 실제는 sparse)
-# valid는 Y만 crop (X·Z는 격자=타깃)
+# 전 축 격자=타깃, padding 없음 (Y=±10.2m=20.4m=68칸)
 ```
 
 검증:

@@ -1,5 +1,19 @@
 # 내가 생각하는 테슬라 Occupancy Network 아키텍처 - Ver.4
 
+> ⚠️ **이 문서는 Ver.4 사고 기록(아카이브)입니다. 최신 canonical 설계가 아닙니다.**
+>
+> 최신 정본은 [occupancy_network_architecture.md](occupancy_network_architecture.md) 다. 두 문서의 수치가 다르면 **occupancy_network_architecture.md가 우선**한다.
+>
+> 주요 차이 (이 문서 = 옛 예시 / canonical = 현재):
+> - 최종 voxel: **0.2m → 0.3m**
+> - 해상도 단계: **1.6/0.8/0.4m → 1.2/0.6/0.3m**
+> - Y range: **±10m → ±10.2m (20.4m, 격자=타깃)**, Z: **[0, +5] → [-2, +4] (중력 정렬)**
+> - 최종 표현: structured sub-voxel head → **sparse deconv + 2단 게이트 prune + near-surface free shell**
+> - temporal: ViewFormer z-squeeze BEV → **Tesla/PanoOcc식 0.6m 3D (align+concat+3D conv)**
+> - Surface: ZPool → **z-flatten**, Queryable: **occupancy 전용**(semantic은 3D Semantics Head)
+>
+> 아래 본문의 수치/구조는 사고 과정 기록으로만 참고하고, 구현은 canonical 문서와 그 6개월 plan.md를 따른다.
+
 ```yaml
 # A. Tesla public main architecture
 #    공개 발표 그림에 직접 대응되는 기본 흐름

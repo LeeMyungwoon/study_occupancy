@@ -34,11 +34,11 @@ def compute_padded_shapes(coarse_shape, num_deconv):
 검증:
 
 ```text
-range: X 60m(rear10~front50), Y 20m(±10, 내부 20.4m padded), Z 6m(-2~+4)
+range: X 60m(rear10~front50), Y 20.4m(±10.2, 격자=타깃), Z 6m(-2~+4)
 1.2m: 50 x 17 x 5   = 4,250
 0.6m: 100 x 34 x 10 = 34,000
 0.3m: 200 x 68 x 20 = 272,000
-(X·Z는 격자=타깃, Y만 0.4m padding -> valid는 Y만 crop)
+(X·Y·Z 전부 격자=타깃, padding 없음)
 ```
 
 ## D037 - PanoOcc 발췌 읽기
@@ -81,26 +81,31 @@ class TwoStageVoxelDecoder(nn.Module):
 pytest phases/phase_04_deconv_occupancy_head/tests/test_voxel_decoder.py -q
 ```
 
-## D039 - valid crop / valid mask (Y축만)
+## D039 - 좌표 규약 / grid=target 검증 (padding/crop 불필요)
 
 수정 파일:
 
 ```text
-phases/phase_04_deconv_occupancy_head/src/voxel_decoder.py
-phases/phase_04_deconv_occupancy_head/tests/test_voxel_decoder.py
+phases/phase_04_deconv_occupancy_head/src/grid_config.py
+phases/phase_04_deconv_occupancy_head/tests/test_grid_config.py
 ```
 
-구현:
+작업:
 
-```python
-def crop_valid_03m(feat):
-    # X·Z는 격자=타깃 (200, 20 그대로), Y만 valid crop
+```text
+architecture Section 1.1 (Coordinate Conventions)을 읽고 grid 규약을 코드로 고정한다:
+  origin = (-10, -10.2, -2) m, half-open cell, cell center = origin + (idx+0.5)*s
+  point -> index = floor((x - origin)/s)
+  parent-child: 1.2m(i) -> 0.6m(2i,2i+1) -> 0.3m(4i..4i+3), ratio 정확히 2
+전 축 격자=타깃이라 padding도 valid crop도 없다 (이전의 crop_valid_03m 불필요).
 ```
 
 검증:
 
 ```text
-crop 후 shape가 정확해야 한다 (X 200, Z 20 유지, Y만 valid).
+X 60m=200, Y 20.4m=68, Z 6m=20 모두 정수로 떨어진다 (assert).
+voxel center / point->index round-trip이 일치한다.
+1.2m->0.6m->0.3m index mapping이 ratio 2로 정확히 맞는다.
 ```
 
 ## D040 - Occupancy Head (0.3m dense 프로토타입)
@@ -183,7 +188,7 @@ input:
 
 output:
   갈래 A: 0.6m occupancy (100 x 34 x 10)
-  갈래 B: 0.3m occupancy (200 x 68 x 20, Y valid crop)
+  갈래 B: 0.3m occupancy (200 x 68 x 20, 전 축 격자=타깃)
 ```
 
 ## D044 - decoder toy training

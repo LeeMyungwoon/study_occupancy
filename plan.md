@@ -1059,11 +1059,11 @@ def compute_padded_shapes(coarse_shape, num_deconv): ...
 검증:
 
 ```text
-range: X 60m(rear10~front50), Y 20m(±10, 내부 20.4m padded), Z 6m(-2~+4)
+range: X 60m(rear10~front50), Y 20.4m(±10.2, 격자=타깃), Z 6m(-2~+4)
 1.2m: 50 x 17 x 5   = 4,250
 0.6m: 100 x 34 x 10 = 34,000
 0.3m: 200 x 68 x 20 = 272,000
-(X·Z는 격자=타깃, Y만 0.4m padding -> valid는 Y만 crop)
+(X·Y·Z 전부 격자=타깃, padding 없음)
 ```
 
 ### D037: PanoOcc 발췌 읽기
@@ -1100,24 +1100,29 @@ class TwoStageVoxelDecoder(nn.Module):
     # (toy 단계는 dense 프로토타입. Phase 08에서 2단계째를 sparse deconv + prune으로 교체)
 ```
 
-### D039: valid crop / mask (Y축만)
+### D039: 좌표 규약 / grid=target 검증 (padding/crop 불필요)
 
 수정 파일:
 
 ```text
-phases/phase_04_deconv_occupancy_head/src/voxel_decoder.py
+phases/phase_04_deconv_occupancy_head/src/grid_config.py
 ```
 
-구현:
+작업:
 
-```python
-def crop_valid_03m(feat): ...   # X·Z는 격자=타깃, Y만 crop
+```text
+architecture Section 1.1 (Coordinate Conventions) 규약을 코드로 고정:
+  origin (-10, -10.2, -2)m, half-open cell, center=origin+(idx+0.5)*s,
+  point->index=floor((x-origin)/s), parent-child ratio 정확히 2.
+전 축 격자=타깃이라 padding/valid crop 없음.
 ```
 
 검증:
 
 ```text
-200 x 68 x 20 -> Y만 valid crop (X 200, Z 20 그대로)
+X 60m=200, Y 20.4m=68, Z 6m=20 정수 떨어짐 assert.
+voxel center / point->index round-trip 일치.
+1.2m->0.6m->0.3m index mapping ratio 2 정확.
 ```
 
 ### D040: Occupancy Head (0.3m dense 프로토타입)
@@ -1308,7 +1313,7 @@ channels: 32
 coarse_shape: [50, 17, 5]      # 1.2m
 mid_shape: [100, 34, 10]       # 0.6m (dense, temporal/coarse occ)
 fine_shape: [200, 68, 20]      # 0.3m (toy 프로토타입은 dense, 실제는 sparse)
-# valid는 Y만 crop (X·Z는 격자=타깃)
+# 전 축 격자=타깃, padding 없음 (Y=±10.2m=20.4m=68칸)
 ```
 
 ### D052: MultiCameraSyntheticDataset
@@ -2192,20 +2197,27 @@ boundary / uncertainty / dynamic / planner 영역 score가 높음
 far-field는 keep을 더 높여 원거리 물체 보호 (프루닝 비가역, recall 우선)
 ```
 
-### D099: quota 기반 keep (v1.5)
+### D099: Pruning false-negative 방어 (v1 필수, architecture Section 8.2.1)
+
+프루닝 false negative가 가장 위험(coarse가 얇은 물체 free 오판 시 0.3m 복구 불가, 비가역).
+v1.5가 아니라 v1부터 5가지 전부 넣는다.
 
 구현:
 
 ```python
-def quota_keep(category_scores, quotas): ...
-    # 단순 top-k가 얇은 물체/원거리/저신뢰 occupied를 먼저 자르는 문제 보호
+# 1. recall-first gate (게이트① 임계값 recall 기준)
+# 2. uncertainty keep (p~0.5/unknown/저신뢰 parent 무조건 keep)
+def quota_keep(category_scores, quotas): ...   # 3. category quota
+# 4. GT-guided warmup (초기 GT occupied parent 강제 keep)
+# 5. soft / straight-through top-k (keep에 gradient)
 ```
 
 검증:
 
 ```text
-quota별 selected count 확인
-near/far/dynamic/planner/thin 카테고리별 최소 keep 보장
+prune_recall(GT occupied 생존율) 측정 - 핵심 지표
+얇은 물체 toy에서 coarse가 약해도 recall 유지
+quota별 selected count / 카테고리별 최소 keep 보장
 중복 제거 확인
 ```
 

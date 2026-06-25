@@ -241,7 +241,7 @@ dynamic / flow:
 ```text
 v1 debug에서는 memory 절약을 위해 tiny shape도 허용한다.
 real config에서는 0.6m=100x34x10 / 0.3m=200x68x20 shape contract를 문서화한다.
-(X·Z는 격자=타깃, Y만 valid crop)
+(X·Y·Z 전부 격자=타깃, padding 없음)
 ```
 
 검증:
