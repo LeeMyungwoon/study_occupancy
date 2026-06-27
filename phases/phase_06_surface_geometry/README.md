@@ -1,30 +1,33 @@
-# Phase 06 - Road Surface Geometry
+# Phase 06 - Surface Outputs Head
 
 기간: D066-D080  
-목표: `Road Surface Geometry Head`를 구현한다. v1 core는 `z_surface`, `valid`, `uncertainty`에 집중한다.
+목표: Tesla Surface Outputs처럼 Volume Outputs와 분리된 dense BEV `SurfaceOutputsHead`를 구현한다. v1 core는 `z_surface`, `slope/normal`, `step`, `valid`, `uncertainty`, `traversability_cost`, `drop_risk`를 포함한다.
 
 이 phase의 핵심은 3D occupancy와 surface를 분리해서 이해하는 것이다.  
 occupancy는 `X x Y x Z` 공간 안에서 각 voxel이 차 있는지 보는 출력이고, surface는 각 `X, Y` 위치에서 "주행 가능한 바닥 높이가 어디인가"를 예측하는 BEV 출력이다.
 
-v1에서 surface는 다음 세 가지를 예측한다.
+v1에서 surface는 다음 출력을 예측한다.
 
 ```text
-z_surface:     B x 1 x X x Y  # 각 BEV cell의 바닥 높이
-valid_logit:   B x 1 x X x Y  # 이 cell에 의미 있는 surface가 있는지
-uncertainty:   B x 1 x X x Y  # 높이 예측이 얼마나 불확실한지
+z_surface:          B x 1 x X x Y  # 각 BEV cell의 바닥 높이
+valid_logit:        B x 1 x X x Y  # 이 cell에 의미 있는 surface가 있는지
+uncertainty:        B x 1 x X x Y  # 높이 예측이 얼마나 불확실한지
+slope_or_normal:    B x * x X x Y  # surface 기울기 또는 normal
+step_height:        B x 1 x X x Y  # 인접 cell 높이 차이/step risk
+traversability_cost:B x 1 x X x Y  # geometry-derived 통과 비용
+drop_risk:          B x 1 x X x Y  # hole / 급격한 하강 / no-ground 위험
 ```
 
-v1에서 slope, normal, step은 별도 neural head로 만들지 않는다.  
-먼저 `z_surface`에서 미분/차분으로 유도한다. 이렇게 해야 head 수가 폭발하지 않고, "surface의 본체는 높이장(height field)"이라는 감각을 유지할 수 있다.
+Road semantics(차선/주행구역 class)는 두지 않는다. 다만 planner가 바로 쓸 수 있도록 `traversability_cost`와 `drop_risk` 같은 geometry-derived risk는 v1 Surface output에 포함한다.
 
 ## 이 phase가 끝나면 할 수 있어야 하는 것
 
 ```text
 1. 3D occupancy target에서 2D surface height target을 만들 수 있다.
-2. 0.6m 3D feature(F_0.6)에서 BEV surface map을 예측할 수 있다 (z-flatten, ZPool 금지).
-3. flat / ramp / curb / stair toy scene에서 z_surface, valid, step score를 볼 수 있다.
+2. 0.6m dense 3D feature(F_0.6)에서 BEV surface map을 예측할 수 있다 (z-flatten, ZPool 금지).
+3. flat / ramp / curb / stair / drop toy scene에서 z_surface, valid, step, traversability, drop risk를 볼 수 있다.
 4. occupancy loss와 surface loss를 같이 학습해도 NaN 없이 loss가 감소한다.
-5. surface uncertainty를 active mask/refinement 후보로 넘길 수 있다.
+5. Surface Outputs가 0.3m sparse volume head의 후처리가 아니라 별도 dense BEV branch임을 설명할 수 있다.
 ```
 
 ## D066 - RoadBEV / road surface 개념 정리
@@ -84,6 +87,15 @@ def make_surface_valid_mask(occ, min_occupied_count=1):
     """
     각 X,Y column에 surface를 정의할 수 있는지 판단한다.
     """
+
+def make_step_height_target(z_surface):
+    ...
+
+def make_traversability_cost_target(z_surface, slope, step):
+    ...
+
+def make_drop_risk_target(z_surface, valid):
+    ...
 ```
 
 구현 순서:
@@ -126,6 +138,9 @@ phases/phase_06_surface_geometry/tests/test_surface_head.py
 ```python
 class ZFlatten(nn.Module):
     """
+    Surface Outputs Head는 0.6m dense feature를 입력으로 받는 별도 branch다.
+    0.3m sparse volume head의 후처리가 아니다.
+
     입력:  B x C x X x Y x Z
     출력:  B x Cb x X x Y
 
@@ -162,7 +177,7 @@ notes.md에 ZPool(누르기)과 z-flatten(채널로 펼치기)의 차이를 적�
 "바닥 높이를 예측하는데 높이축을 먼저 누르면 정답 단서를 버리는 셈"(L3)을 설명할 수 있어야 한다.
 ```
 
-## D069 - SurfaceGeometryHead
+## D069 - SurfaceOutputsHead
 
 수정 파일:
 
@@ -173,13 +188,17 @@ phases/phase_06_surface_geometry/src/surface_head.py
 구현:
 
 ```python
-class SurfaceGeometryHead(nn.Module):
+class SurfaceOutputsHead(nn.Module):
     """
     input:  B x C x X x Y x Z
     output:
-      z_surface:   B x 1 x X x Y
-      valid_logit: B x 1 x X x Y
-      uncertainty: B x 1 x X x Y
+      z_surface:           B x 1 x X x Y
+      valid_logit:         B x 1 x X x Y
+      uncertainty:         B x 1 x X x Y
+      slope_or_normal:     B x * x X x Y
+      step_height:         B x 1 x X x Y
+      traversability_cost: B x 1 x X x Y
+      drop_risk:           B x 1 x X x Y
     """
 ```
 
@@ -188,7 +207,7 @@ class SurfaceGeometryHead(nn.Module):
 ```text
 1. ZFlatten(z-flatten)으로 3D feature를 BEV feature로 바꾼다 (ZPool 금지, L3).
 2. 2D Conv block 2개 정도로 BEV context를 섞는다.
-3. z_surface head, valid_logit head, uncertainty_raw head를 분리한다.
+3. z_surface / valid_logit / uncertainty_raw / slope_or_normal / step / traversability / drop_risk head를 분리한다.
 4. uncertainty에는 아직 softplus를 적용하지 않아도 된다. D078에서 정리한다.
 ```
 
@@ -198,6 +217,8 @@ class SurfaceGeometryHead(nn.Module):
 z_surface: B x 1 x X x Y
 valid_logit: B x 1 x X x Y
 uncertainty: B x 1 x X x Y
+traversability_cost: B x 1 x X x Y
+drop_risk: B x 1 x X x Y
 모든 출력에 NaN이 없다.
 ```
 
@@ -233,6 +254,11 @@ def surface_valid_bce(valid_logit, valid):
 
 def surface_uncertainty_loss(z_pred, z_gt, valid, uncertainty):
     """
+
+def surface_slope_or_normal_loss(...): ...
+def step_height_loss(...): ...
+def traversability_cost_loss(...): ...
+def drop_risk_loss(...): ...
     선택 사항.
     큰 오차에는 큰 uncertainty를 허용하고,
     작은 오차에는 uncertainty가 커지지 않도록 regularize한다.
@@ -242,7 +268,7 @@ def surface_uncertainty_loss(z_pred, z_gt, valid, uncertainty):
 검증:
 
 ```text
-invalid cell은 z loss에 영향을 주면 안 된다.
+invalid cell은 z / slope / step / traversability / drop-risk loss에 영향을 주면 안 된다.
 valid가 전부 False인 batch에서도 NaN이 나면 안 된다.
 z_pred == z_gt이면 z loss가 거의 0이다.
 ```
@@ -266,7 +292,7 @@ phases/phase_06_surface_geometry/scripts/train_surface_one_batch.py
 ```text
 1. synthetic flat surface feature/target을 만든다.
 2. synthetic ramp surface feature/target을 만든다.
-3. SurfaceGeometryHead만 단독으로 학습한다.
+3. SurfaceOutputsHead만 단독으로 학습한다.
 4. 200 iteration 정도에서 one-batch overfit을 확인한다.
 ```
 
@@ -276,6 +302,8 @@ phases/phase_06_surface_geometry/scripts/train_surface_one_batch.py
 iter
 loss_z
 loss_valid
+loss_traversability
+loss_drop_risk
 z_mae
 valid_acc
 ```
@@ -312,6 +340,8 @@ z_error.png
 valid_pred.png
 valid_gt.png
 uncertainty.png
+traversability_cost.png
+drop_risk.png
 ```
 
 구현 기준:
@@ -354,6 +384,11 @@ def compute_normal_from_z(z_surface, dx=0.6, dy=0.6):
 
 def compute_step_score_from_z(z_surface, threshold=0.25):
     """
+
+def compute_geometry_risk_from_surface(z_surface, valid, slope, step):
+    """
+    z/slope/step/valid에서 traversability_cost와 drop_risk 후보를 만든다.
+    """
     인접 cell 높이 차이가 큰 곳을 step/curb 후보로 본다.
     """
 ```
@@ -361,9 +396,9 @@ def compute_step_score_from_z(z_surface, threshold=0.25):
 이해:
 
 ```text
-v1에서는 slope/normal/step을 별도 head로 만들지 않는다.
-z_surface에서 유도한다.
-이렇게 해야 head가 너무 많아지는 것을 막고, surface geometry의 중심을 z height로 유지할 수 있다.
+v1에서는 z_surface에서 slope/normal/step/risk target을 유도할 수 있다.
+최종 SurfaceOutputsHead는 z_surface뿐 아니라 traversability_cost / drop_risk도 직접 출력한다.
+이 둘은 semantic class가 아니라 geometry-derived risk다.
 ```
 
 검증:
@@ -472,7 +507,8 @@ phases/phase_06_surface_geometry/tests/test_model_with_surface.py
 
 ```text
 phase_05 SingleFrameOccNet 구조
-+ SurfaceGeometryHead
++ 0.6m dense feature 기반 SurfaceOutputsHead
+주의: Surface Outputs는 0.3m sparse volume head의 후처리가 아니라 별도 dense BEV branch.
 ```
 
 권장 forward output:
@@ -484,6 +520,8 @@ phase_05 SingleFrameOccNet 구조
         "z_surface": z_surface,
         "valid_logit": valid_logit,
         "uncertainty": uncertainty,
+        "traversability_cost": traversability_cost,
+        "drop_risk": drop_risk,
     },
 }
 ```
@@ -517,6 +555,9 @@ phases/phase_06_surface_geometry/scripts/train_occ_surface.py
 L_total = L_occ
         + lambda_z * L_surface_z
         + lambda_valid * L_surface_valid
+        + lambda_step * L_step_height
+        + lambda_trav * L_traversability_cost
+        + lambda_drop * L_drop_risk
         + lambda_consistency * L_consistency
 ```
 
@@ -525,6 +566,9 @@ L_total = L_occ
 ```text
 lambda_z = 1.0
 lambda_valid = 0.5
+lambda_step = 0.3
+lambda_trav = 0.3
+lambda_drop = 0.3
 lambda_consistency = 0.05
 ```
 
@@ -573,8 +617,8 @@ uncertainty가 loss를 NaN으로 만들지 않는다.
 이해:
 
 ```text
-uncertainty는 "이 cell을 믿어도 되는가"를 active mask에 넘기는 신호가 될 수 있다.
-높은 uncertainty cell은 refinement 후보가 될 수 있다.
+uncertainty는 "이 cell을 믿어도 되는가"를 planner cost와 Queryable budget에 넘기는 신호가 될 수 있다.
+높은 uncertainty cell은 collision_state에서 보수적으로 다뤄야 한다.
 ```
 
 ## D079 - surface metrics
@@ -600,6 +644,12 @@ def valid_accuracy(valid_logit, valid):
 
 def step_f1(step_score, step_gt):
     ...
+
+def traversability_error(cost_pred, cost_gt, valid):
+    ...
+
+def drop_risk_auc(drop_logit, drop_gt, valid):
+    ...
 ```
 
 검증:
@@ -613,7 +663,7 @@ valid_accuracy는 threshold 기준으로 계산된다.
 기록:
 
 ```text
-v1 최종 평가에서는 surface MAE, valid accuracy를 필수 metric으로 가져간다.
+v1 최종 평가에서는 surface MAE, valid accuracy, traversability error, drop-risk AUC를 필수 metric으로 가져간다.
 step_f1은 toy scene 분석용으로 둔다.
 ```
 
@@ -637,10 +687,10 @@ phases/phase_06_surface_geometry/notes.md
 
 ```text
 1. surface head가 occupancy head와 다른 이유
-2. z_surface / valid / uncertainty의 의미
+2. z_surface / valid / uncertainty / traversability_cost / drop_risk의 의미
 3. flat / ramp / step / stair toy scene 결과
 4. surface loss weight 기본값
-5. active mask에 넘길 surface signal
+5. planner / Queryable budget에 넘길 surface signal
 6. final_occnet_v1로 가져갈 파일 목록
 ```
 

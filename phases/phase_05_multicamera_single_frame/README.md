@@ -1,7 +1,7 @@
 # Phase 05 - Multi-camera Single-frame Occupancy
 
 기간: D051-D065  
-목표: multi-camera image tokens, canonical ray PE, 1.2m 3D query attention, 3D decoder(1.2m->0.6m->0.3m), occupancy head(2-갈래, dense 프로토타입)를 하나의 single-frame 모델로 연결한다.
+목표: multi-camera image tokens, canonical ray PE, 1.2m 3D query attention, 3D decoder(1.2m->0.6m->0.3m), occupancy head(2-갈래, dense 프로토타입), auxiliary depth/free-space evidence head를 하나의 single-frame 모델로 연결한다.
 
 ## D051 - tiny config 작성
 
@@ -142,12 +142,15 @@ class SingleFrameOccNet(nn.Module):
     lifter                 # 1.2m
     two_stage_decoder      # 1.2m -> 0.6m -> 0.3m
     occupancy_head         # 0.6m coarse dense + 0.3m fine (toy는 dense 프로토타입)
+    aux_depth_head         # v1 inference에도 필요한 depth/free-space evidence
 ```
 
 출력:
 
 ```text
-occ_logits
+occ_coarse_logits
+occ_fine_logits
+aux_depth / depth_confidence / free_space_confidence
 ```
 
 ## D057 - model shape test
@@ -162,7 +165,7 @@ phases/phase_05_multicamera_single_frame/tests/test_model_shape.py
 
 ```text
 B=1과 B=2에서 forward 성공
-occ_logits shape 확인
+occ_coarse / occ_fine / aux_depth output shape 확인
 NaN 없음
 ```
 
@@ -284,23 +287,55 @@ class RealDatasetStub(Dataset):
 
 ```text
 나중에 실제 dataset을 붙여도 model 코드를 많이 바꾸지 않도록 interface를 정한다.
+architecture Section 19의 GT 출력을 받을 수 있는 key를 미리 고정한다.
+
+필수/준필수 key:
+  images / intrinsics / extrinsics_or_virtual_extrinsics / ego_pose
+  occupancy (occupied / free / unknown)
+  visibility / observed_free_evidence targets
+  z_surface / surface_valid / traversability_cost / drop_risk
+  dynamic mask / flow
+  continuous SDF / surface-shell samples (optional, Sub-Voxel Shape / Queryable 학습용)
+  dense or sparse metric depth / depth confidence
+  free-space ray evidence
 ```
 
-## D064 - single-frame overfit 안정화
+## D064 - Auxiliary Depth / Free-space Evidence Head (v1 inference-critical)
 
-작업:
+만들 파일:
 
 ```text
-learning rate 조정
-channel 수 조정
-valid mask 확인
-loss가 안 내려가면 attention block을 일시적으로 단순화
+phases/phase_05_multicamera_single_frame/src/aux_depth_head.py
+phases/phase_05_multicamera_single_frame/src/aux_depth_losses.py
+phases/phase_05_multicamera_single_frame/tests/test_aux_depth_head.py
 ```
 
-기록:
+구현:
 
 ```text
-notes.md에 성공한 hyperparameter 기록
+image feature 또는 low-res multi-camera feature에서
+low-res depth/range, depth_confidence, free_space_confidence를 예측한다.
+
+이 head는 단순 training auxiliary가 아니라 추론 시에도 유지한다.
+Section 10의 observed_free_evidence_0.3(child) /
+observed_free_evidence_0.6(parent)는 이 head의 high-confidence ray/depth만 사용한다.
+confidence가 낮으면 observed free가 아니라 unknown으로 보수 처리한다.
+```
+
+loss:
+
+```python
+def depth_loss(depth_pred, depth_gt, confidence): ...
+def depth_conf_loss(conf_pred, depth_error_or_target): ...
+def free_space_evidence_loss(free_space_logit, ray_free_target, valid_ray_mask): ...
+```
+
+검증:
+
+```text
+synthetic depth GT에서 L_depth / L_depth_conf / L_free_space_evidence가 감소한다.
+hit 뒤쪽 / occluded / 미관측 구간을 free negative로 쓰지 않는다.
+pred_free_shell free 즉답은 child-level observed-free evidence 없이는 금지됨을 unit test로 확인한다.
 ```
 
 ## D065 - Phase 05 report
@@ -317,5 +352,6 @@ pytest phases/phase_05_multicamera_single_frame/tests -q
 multi-camera token shape
 coarse 3D feature shape
 single-frame occupancy 결과
+auxiliary depth/free-space evidence head의 출력 shape
+observed-free evidence가 없으면 free로 반환하지 않는 보수 규칙
 ```
-

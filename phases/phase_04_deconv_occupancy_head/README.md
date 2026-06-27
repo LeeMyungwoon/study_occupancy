@@ -8,8 +8,10 @@
 ```text
 실제 크기에선 0.3m dense feature volume(272k voxel)은 금지다.
 toy 단계에서는 학습 흐름 이해를 위해 dense 프로토타입을 먼저 만든다.
-Phase 08에서 sparse deconv + 2단 게이트 prune으로 전환한다 (architecture Section 16 Stage 1).
-free/unknown은 0.6m coarse dense, occupied 표면은 0.3m이 담당한다 (2-해상도 hybrid).
+Phase 08에서 sparse deconv + recall-first 2단 게이트 prune으로 전환한다.
+free/unknown은 0.6m coarse dense가 담당하고,
+0.3m fine branch는 occupied logit + surface-band auxiliary의 toy 프로토타입이다.
+0.6m coarse branch에는 occupied/free/unknown/visibility와 mixed_surface_risk를 둔다.
 ```
 
 ## D036 - grid shape 계산
@@ -55,7 +57,8 @@ coarse-to-fine sparse decoder + occupancy 프루닝 설명
 ```text
 deconv가 하는 일
 왜 0.3m dense feature까지 만들지 않는지 (272k voxel -> sparse deconv + prune으로 대체)
-coarse-to-fine + occupancy 프루닝(keep ratio)의 의미
+coarse-to-fine + recall-first occupancy 프루닝의 의미
+keep ratio는 hard rule이 아니라 soft budget target임
 ```
 
 ## D038 - TwoStageVoxelDecoder
@@ -121,16 +124,19 @@ phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 
 ```python
 class OccupancyHead(nn.Module):
-    # 갈래 A: coarse dense @ 0.6m -> occupied/free/unknown/visibility logits
-    # 갈래 B: fine @ 0.3m -> occupied 표면 정밀 logit
-    # toy 단계는 dense 0.3m로 프로토타입 (Phase 08에서 sparse kept voxel 위로 전환)
+    # 갈래 A: coarse dense @ 0.6m
+    #   -> occupied/free/unknown logits + visibility_logit + mixed_surface_risk_logit
+    # 갈래 B: fine @ 0.3m
+    #   -> occupied logit + surface-band auxiliary logit
+    # toy 단계는 dense 0.3m로 프로토타입 (Phase 08에서 sparse prelim_kept 위로 전환)
 ```
 
 설계 원리:
 
 ```text
 free/unknown(빈 공간, 저주파)은 0.6m coarse dense에서 담당한다.
-occupied 표면(고주파)만 0.3m로 정밀하게 푼다.
+mixed_surface_risk는 0.6m parent gate가 얇은 물체/표면 혼합 parent를 free로 자르지 않게 돕는다.
+0.3m fine branch는 occupied/surface-band 후보를 정밀하게 푼다.
 이렇게 나눠야 dense 0.3m 비용을 피하면서 정밀 표면을 얻는다.
 ```
 
@@ -145,9 +151,9 @@ phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 테스트:
 
 ```text
-갈래 A: 0.6m dense에서 free/unknown/occupied/visibility logit shape 확인
-갈래 B: 0.3m에서 occupied logit shape 확인
-free/unknown은 0.6m, occupied 표면은 0.3m이 책임진다는 분업을 synthetic value로 확인
+갈래 A: 0.6m dense에서 occupied/free/unknown/visibility/mixed_surface_risk logit shape 확인
+갈래 B: 0.3m에서 occupied logit + surface-band auxiliary logit shape 확인
+free/unknown은 0.6m, occupied/surface-band 후보는 0.3m이 책임진다는 분업을 synthetic value로 확인
 ```
 
 완료 기준:
@@ -168,8 +174,11 @@ phases/phase_04_deconv_occupancy_head/tests/test_losses.py
 구현:
 
 ```python
-def occupancy_loss(logits, target, valid_mask):
-    # BCE or focal, unknown은 ignore mask
+def coarse_occupancy_loss(cls_logits, visibility_logit, mixed_surface_risk_logit, target):
+    # occupied/free/unknown CE(or focal) + visibility BCE + mixed_surface_risk BCE
+
+def fine_occupancy_loss(occ_logit, surface_band_logit, target, valid_mask):
+    # occupied/free/ignore + surface-band auxiliary supervision
 ```
 
 ## D043 - decoder + occupancy head end-to-end shape
@@ -187,8 +196,8 @@ input:
   B x C x 50 x 17 x 5  (1.2m)
 
 output:
-  갈래 A: 0.6m occupancy (100 x 34 x 10)
-  갈래 B: 0.3m occupancy (200 x 68 x 20, 전 축 격자=타깃)
+  갈래 A: 0.6m occupied/free/unknown/visibility/mixed_surface_risk
+  갈래 B: 0.3m occupied + surface-band auxiliary (200 x 68 x 20, toy dense)
 ```
 
 ## D044 - decoder toy training
@@ -295,6 +304,8 @@ ratio
 ```text
 occupancy_network_architecture.md Section 8(deconv/2단 게이트), 9(4 volume heads)를 읽는다.
 dense 0.3m 프로토타입과 실제 sparse deconv+prune의 차이를 notes.md에 정리한다.
+0.6m mixed_surface_risk가 Phase 08 parent gate recall 보호에 쓰인다는 점을 기록한다.
+fine surface-band auxiliary가 pred_boundary / pred_heavy_mask의 학습 발판임을 기록한다.
 ```
 
 ## D050 - Phase 04 report
@@ -311,6 +322,7 @@ pytest phases/phase_04_deconv_occupancy_head/tests -q
 1. deconv shape (1.2m -> 0.6m -> 0.3m)
 2. 2-갈래 occupancy head shape
 3. 0.3m dense 프로토타입과 sparse deconv+prune의 차이
-4. free/unknown(0.6m coarse) vs occupied 표면(0.3m)의 2-해상도 hybrid
+4. free/unknown(0.6m coarse) vs occupied/surface-band 후보(0.3m)의 2-해상도 hybrid
 5. channel ablation 결과
+6. mixed_surface_risk / surface-band auxiliary를 왜 따로 두는지
 ```

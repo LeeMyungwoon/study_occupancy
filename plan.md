@@ -17,13 +17,18 @@ multi-camera image
 -> dense deconv: 1.2m -> 0.6m
 -> 0.6m pre-temporal refinement (BEVDet4D 교훈: temporal 전 정리)
 -> Tesla/PanoOcc-style 0.6m 3D temporal (z 유지, align+concat+3D residual conv, NOT attention)
--> coarse dense occupancy/visibility @ 0.6m (free/unknown + 프루닝 게이트 기준)
--> sparse deconv + 2단 게이트 prune (0.6m parent gate + 0.3m child prune) + near-surface free shell
--> 30cm sparse surface feature (kept voxels)
--> Tesla-style 4 volume heads (Occupancy / Flow(vx,vy,vz) / Sub-Voxel Shape / 3D Semantics)
--> Surface Outputs head (z-flatten, geometry only)
--> active/exposed-face mask
--> packed Queryable MLP (occupancy 전용)
+-> coarse dense occupancy/visibility/mixed_surface_risk @ 0.6m (free/unknown + 프루닝 guide)
+-> sparse deconv + recall-first 2단 게이트 prune
+   (0.6m parent gate + 0.3m child score/prune + near-surface free shell tag)
+-> 30cm sparse candidate feature F_0.3_sparse = prelim_kept
+   (= child_score_keep_candidates ⊎ prelim_free_shell)
+-> O_occ_fine on [N_kept] -> 6-way pred label + pred_heavy_mask
+-> Tesla-style 4 volume heads
+   (Occupancy / Occupancy Flow / Sub-Voxel Shape / 3D Semantics)
+-> Surface Outputs head (z-flatten, geometry + geometry-derived risk)
+-> exposed-face mask on pred_heavy_mask
+-> packed Queryable interface
+   (surface_shell_prob + planner collision_state, semantic query 없음)
 ```
 
 20 FPS v1 원칙:
@@ -39,8 +44,13 @@ multi-camera image
 필수:
   1.2m -> 0.6m까지만 dense feature 유지
   0.6m 3D temporal (z 유지, align+concat+3D residual conv)
-  0.6m -> 0.3m은 sparse deconv + 2단 게이트 prune (keep ~0.5) + near-surface free shell
-  Queryable MLP는 selected voxel(occupancy 전용) 평가에만 사용
+  0.6m -> 0.3m은 sparse deconv + recall-first 2단 게이트
+  high-confidence free만 drop, unknown/uncertain/mixed-surface-risk는 keep 또는 ignore
+  keep ~0.5는 soft budget target일 뿐 mandatory recall keep이 우선
+  prelim_kept와 최종 pred_* label을 분리
+  Queryable MLP는 pred_heavy_mask branch(A)에서 surface_shell_prob만 예측
+  planner collision은 surface_shell_prob 단독이 아니라 collision_state fallback으로 결정
+  auxiliary depth/free-space evidence head는 v1 inference-critical
   K_total / Q_total hard cap
   packed batched Queryable MLP
   one-batch overfit
@@ -50,15 +60,28 @@ multi-camera image
 
 ```text
 architecture 문서의 최종 30cm 표현은
-sparse deconv + 2단 게이트 프루닝(0.6m parent gate + 0.3m child prune)으로
-점유 표면 voxel만 남기고, near-surface free 1겹(L2)을 함께 keep한다.
+sparse deconv + 2단 게이트 프루닝(0.6m parent gate + 0.3m child score/prune)으로
+F_0.3_sparse = prelim_kept를 만든다.
+prelim_kept는 최종 label이 아니라 O_occ_fine을 실행할 sparse index set이며,
+child_score_keep_candidates ⊎ prelim_free_shell로 구성된다.
+near_surface_free_shell_tag는 prelim_free_shell index source가 아니라
+최종 pred_free_shell / pred_free_kept를 가르는 semantic tag다.
 (dense 0.3m feature volume은 만들지 않는다.)
 
 이 plan의 Phase 04는 학습 초기엔 dense 프로토타입으로 0.3m occupancy를 만들고,
 Phase 08에서 sparse deconv + 2단 게이트 prune으로 전환한다
 (architecture 문서 Section 16 Stage 1의 권장 순서).
 
-Queryable은 Tesla 2-MLP 중 occupancy MLP만 둔다(semantic은 3D Semantics Head).
+O_occ_fine 이후 kept voxel은
+pred_occupied_surface / pred_boundary / pred_visibility_frontier /
+pred_free_shell / pred_free_kept / pred_uncertain_kept로 완전 분할된다.
+Flow / Sub-Voxel Shape / 3D Semantics는 pred_heavy_mask
+(pred_occupied_surface | pred_boundary)의 [N_heavy]에서만 실행한다.
+
+Queryable은 Tesla 2-MLP 중 occupancy MLP만 둔다.
+단 이 MLP 출력은 planner collision probability가 아니라 surface_shell_prob이고,
+planner는 collision_state fallback 규칙을 함께 사용한다.
+semantic은 연속 query를 두지 않고 voxel-level 3D Semantics Head에서만 제공한다.
 ```
 
 ---
@@ -147,7 +170,7 @@ study_occupancy/
 첫날 생성 명령:
 
 ```bash
-mkdir -p phases/phase_{01_pytorch_primitives,02_toy_occupancy,03_attention_lifting,04_deconv_structured_head,05_multicamera_single_frame,06_surface_geometry,07_temporal_flow,08_dynamic_resolution_refinement,09_integration_evaluation,10_runtime_final_report}/{src,tests,scripts}
+mkdir -p phases/phase_{01_pytorch_primitives,02_toy_occupancy,03_attention_lifting,04_deconv_occupancy_head,05_multicamera_single_frame,06_surface_geometry,07_temporal_flow,08_sparse_prune_queryable,09_integration_evaluation,10_runtime_final_report}/{src,tests,scripts}
 mkdir -p phases/phase_05_multicamera_single_frame/configs phases/phase_09_integration_evaluation/configs phases/phase_10_runtime_final_report/reports
 mkdir -p final_occnet_v1/src/occnet_v1 final_occnet_v1/tests final_occnet_v1/configs final_occnet_v1/scripts
 ```
@@ -170,19 +193,24 @@ Phase 04, D036-D050:
   1.2m -> 0.6m -> 0.3m deconv, 0.3m occupancy head (dense 프로토타입)
 
 Phase 05, D051-D065:
-  multi-camera token packing, canonical ray PE, single-frame occupancy training
+  multi-camera token packing, canonical ray PE, single-frame occupancy training,
+  auxiliary depth/free-space evidence head
 
 Phase 06, D066-D080:
-  RoadBEV-style surface geometry head (z-flatten, geometry only)
+  Tesla Surface Outputs-style dense BEV head
+  (z_surface / slope / step / uncertainty / traversability_cost / drop_risk)
 
 Phase 07, D081-D095 (+D081a):
   0.6m pre-temporal refinement(D081a),
-  Tesla/PanoOcc-style 0.6m 3D temporal (align+concat+3D conv), per-voxel flow head (vx,vy,vz)
+  Tesla/PanoOcc-style 0.6m 3D temporal (align+concat+3D conv),
+  Occupancy Flow Head 내부 O_motion_0.6 coarse seed + [N_heavy] readout 준비
 
 Phase 08, D096-D110 (+D101a, D101b):
-  sparse deconv + 2단 게이트 prune + near-surface free shell,
-  active/exposed-face mask, Sub-Voxel Shape Head(D101a), 3D Semantics Head(D101b),
-  quota keep, sparse anchor, packed Queryable MLP(occupancy 전용)
+  sparse deconv + recall-first 2단 게이트 prune,
+  prelim_kept / near_surface_free_shell_tag / 6-way pred label 분리,
+  pred_heavy_mask, exposed-face mask,
+  Sub-Voxel Shape Head(D101a), 3D Semantics Head(D101b),
+  quota keep, sparse anchor, packed Queryable interface(surface_shell_prob + collision_state)
 
 Phase 09, D111-D120:
   final model integration, losses, metrics, visualization
@@ -1138,9 +1166,11 @@ phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 
 ```python
 class OccupancyHead(nn.Module):
-    # 갈래 A: coarse dense @ 0.6m -> occupied/free/unknown/visibility logits
-    # 갈래 B: fine @ 0.3m -> occupied 표면 정밀 logit
-    # toy 단계는 dense 0.3m로 프로토타입 (Phase 08에서 sparse kept voxel 위로 전환)
+    # 갈래 A: coarse dense @ 0.6m
+    #   -> occupied/free/unknown logits + visibility_logit + mixed_surface_risk_logit
+    # 갈래 B: fine @ 0.3m
+    #   -> occupied logit + surface-band auxiliary logit
+    # toy 단계는 dense 0.3m로 프로토타입 (Phase 08에서 sparse prelim_kept 위로 전환)
 ```
 
 ### D041: 2-갈래 occupancy 정확성 test
@@ -1154,9 +1184,9 @@ phases/phase_04_deconv_occupancy_head/tests/test_occupancy_head.py
 검증:
 
 ```text
-갈래 A: 0.6m dense에서 free/unknown/occupied/visibility logit shape
-갈래 B: 0.3m에서 occupied logit shape
-free/unknown은 0.6m, occupied 표면은 0.3m이 책임진다는 분업을 synthetic으로 확인
+갈래 A: 0.6m dense에서 occupied/free/unknown/visibility/mixed_surface_risk logit shape
+갈래 B: 0.3m에서 occupied logit + surface-band auxiliary logit shape
+free/unknown은 0.6m, occupied/surface-band 후보는 0.3m이 책임진다는 분업을 synthetic으로 확인
 ```
 
 ### D042: occupancy head loss 연결
@@ -1170,7 +1200,8 @@ phases/phase_04_deconv_occupancy_head/src/losses.py
 구현:
 
 ```python
-def occupancy_loss(logits, target, valid_mask): ...
+def coarse_occupancy_loss(cls_logits, visibility_logit, mixed_surface_risk_logit, target): ...
+def fine_occupancy_loss(occ_logit, surface_band_logit, target, valid_mask): ...
 ```
 
 ### D043: deconv + occupancy head end-to-end shape
@@ -1267,6 +1298,8 @@ phases/phase_04_deconv_occupancy_head/scripts/compute_query_counts.py
 ```text
 occupancy_network_architecture.md의 Section 8(deconv/2단 게이트), 9(4 volume heads)와 현재 코드 비교
 dense 0.3m 프로토타입과 실제 sparse deconv+prune의 차이를 notes.md에 기록
+0.6m mixed_surface_risk가 Phase 08 parent gate recall 보호에 쓰인다는 점을 기록
+fine surface-band auxiliary가 pred_boundary / pred_heavy_mask의 학습 발판임을 기록
 ```
 
 ### D050: Phase 04 report
@@ -1281,7 +1314,8 @@ pytest phases/phase_04_deconv_occupancy_head/tests -q
 
 ```text
 0.3m dense 프로토타입과 (실제) sparse deconv+prune의 차이
-free/unknown은 0.6m coarse, occupied 표면은 0.3m sparse라는 2-해상도 hybrid
+free/unknown은 0.6m coarse, occupied/surface-band 후보는 0.3m sparse라는 2-해상도 hybrid
+mixed_surface_risk / surface-band auxiliary를 왜 따로 두는지
 ```
 
 ---
@@ -1294,6 +1328,8 @@ free/unknown은 0.6m coarse, occupied 표면은 0.3m sparse라는 2-해상도 hy
 
 ```text
 multi-camera token packing과 1.2m cross-attention lifting을 single-frame occupancy training에 연결한다.
+또한 v1 추론에서 pred_free_shell free 즉답에 필요한
+auxiliary depth/free-space evidence head의 최소 형태를 만든다.
 ```
 
 ### D051: phase_05 config 작성
@@ -1527,21 +1563,50 @@ interface는 architecture 문서 Section 19의 GT 출력을
 
 images / intrinsics / pose
 occupancy (occupied / free / unknown)
-z_surface / surface_valid
+visibility / observed_free_evidence targets
+z_surface / surface_valid / traversability_cost / drop_risk
 dynamic mask / flow
-continuous SDF samples (optional, refinement 학습용)
+continuous SDF / surface-shell samples (optional, Sub-Voxel Shape / Queryable 학습용)
+dense or sparse metric depth / depth confidence
+free-space ray evidence
 ```
 
-### D064: single-frame overfit 안정화
+### D064: Auxiliary Depth / Free-space Evidence Head (v1 inference-critical)
 
-할 일:
+만들 파일:
 
 ```text
-learning rate 조정
-channel 수 조정
-loss가 내려가지 않으면 architecture를 단순화
-그래도 불안정하면 auxiliary depth supervision 추가
-(architecture 문서 Section 4, synthetic은 depth GT가 공짜)
+phases/phase_05_multicamera_single_frame/src/aux_depth_head.py
+phases/phase_05_multicamera_single_frame/src/aux_depth_losses.py
+phases/phase_05_multicamera_single_frame/tests/test_aux_depth_head.py
+```
+
+구현:
+
+```text
+image feature 또는 low-res multi-camera feature에서
+low-res depth/range, depth_confidence, free_space_confidence를 예측한다.
+
+이 head는 단순 training auxiliary가 아니라 추론 시에도 유지한다.
+Section 10의 observed_free_evidence_0.3(child) /
+observed_free_evidence_0.6(parent)는 이 head의 high-confidence ray/depth만 사용한다.
+confidence가 낮으면 observed free가 아니라 unknown으로 보수 처리한다.
+```
+
+loss:
+
+```python
+def depth_loss(depth_pred, depth_gt, confidence): ...
+def depth_conf_loss(conf_pred, depth_error_or_target): ...
+def free_space_evidence_loss(free_space_logit, ray_free_target, valid_ray_mask): ...
+```
+
+검증:
+
+```text
+synthetic depth GT에서 L_depth / L_depth_conf / L_free_space_evidence가 감소.
+hit 뒤쪽 / occluded / 미관측 구간을 free negative로 쓰지 않는지 확인.
+pred_free_shell free 즉답은 child-level observed-free evidence 없이는 금지됨을 unit test로 확인.
 ```
 
 ### D065: Phase 05 report
@@ -1558,18 +1623,21 @@ pytest phases/phase_05_multicamera_single_frame/tests -q
 multi-camera token shape
 1.2m query count (4,250)
 single-frame occupancy 결과
+auxiliary depth/free-space evidence head의 출력 shape와 보수적 free 판정 규칙
 ```
 
 ---
 
-## 9. Phase 06: Road Surface Geometry
+## 9. Phase 06: Surface Outputs Head
 
 기간: D066-D080
 
 목표:
 
 ```text
-RoadBEV-style z_surface / valid / uncertainty head를 만든다.
+Tesla Surface Outputs처럼 Volume Outputs와 분리된 dense BEV surface head를 만든다.
+Road semantics(차선/주행구역)는 두지 않지만,
+z_surface / slope / step / valid / uncertainty / traversability_cost / drop_risk를 예측한다.
 ```
 
 ### D066: RoadBEV 발췌 읽기
@@ -1585,7 +1653,8 @@ loss / metric 부분
 기록:
 
 ```text
-occupancy와 surface height map의 차이
+occupancy volume과 별도 Surface Outputs head의 차이
+road semantic은 제외하지만 geometry-derived risk는 포함하는 이유
 ```
 
 ### D067: surface label 생성
@@ -1602,6 +1671,9 @@ phases/phase_06_surface_geometry/tests/test_surface_labels.py
 ```python
 def make_z_surface_from_occ(occ): ...
 def make_surface_valid_mask(occ): ...
+def make_step_height_target(z_surface): ...
+def make_traversability_cost_target(z_surface, slope, step): ...
+def make_drop_risk_target(z_surface, valid): ...
 ```
 
 ### D068: z-flatten (높이를 채널로 보존, ZPool 금지)
@@ -1617,6 +1689,8 @@ phases/phase_06_surface_geometry/tests/test_surface_head.py
 
 ```python
 class ZFlatten(nn.Module):
+    # Surface Outputs Head는 0.6m dense feature를 입력으로 받는 별도 branch다.
+    # 0.3m sparse volume head의 후처리가 아니다.
     # B x C x X x Y x Z -> B x (Z*C) x X x Y -> 1x1 conv -> B x Cb x X x Y
     # 주의: ZPool(평균/최대로 z를 누름) 금지.
     #   바닥 높이(z_surface)를 예측하는 head가 입력에서 높이 단서를 먼저 버리면 안 됨 (L3).
@@ -1629,7 +1703,7 @@ B x C x X x Y x Z -> B x Cb x X x Y (단, 내부적으로 z를 채널로 펼쳐 
 ZPool 대비 z 정보가 head 입력까지 전달되는지 synthetic으로 확인
 ```
 
-### D069: SurfaceGeometryHead
+### D069: SurfaceOutputsHead
 
 수정 파일:
 
@@ -1640,8 +1714,9 @@ phases/phase_06_surface_geometry/src/surface_head.py
 구현:
 
 ```python
-class SurfaceGeometryHead(nn.Module):
+class SurfaceOutputsHead(nn.Module):
     # z_surface, valid_logit, uncertainty
+    # slope_or_normal, step_height, traversability_cost, drop_risk
 ```
 
 ### D070: surface losses
@@ -1657,6 +1732,10 @@ phases/phase_06_surface_geometry/src/surface_losses.py
 ```python
 def surface_huber_loss(z_pred, z_gt, valid): ...
 def surface_valid_bce(valid_logit, valid): ...
+def surface_slope_or_normal_loss(...): ...
+def step_height_loss(...): ...
+def traversability_cost_loss(...): ...
+def drop_risk_loss(...): ...
 ```
 
 ### D071: surface one-batch training
@@ -1670,7 +1749,7 @@ phases/phase_06_surface_geometry/scripts/train_surface_one_batch.py
 검증:
 
 ```text
-z_surface loss 감소
+z_surface / valid / traversability_cost / drop_risk loss 감소
 ```
 
 ### D072: surface visualization
@@ -1699,7 +1778,9 @@ phases/phase_06_surface_geometry/src/surface_derived.py
 
 ```python
 def compute_slope_from_z(z_surface): ...
+def compute_normal_from_z(z_surface): ...
 def compute_step_score_from_z(z_surface): ...
+def compute_geometry_risk_from_surface(z_surface, valid, slope, step): ...
 ```
 
 ### D074: step / curb toy scene
@@ -1744,7 +1825,8 @@ phases/phase_06_surface_geometry/src/model_with_surface.py
 구현:
 
 ```text
-phase_05 SingleFrameOccNet 구조 + surface head
+phase_05 SingleFrameOccNet 구조 + 0.6m dense feature 기반 Surface Outputs Head
+주의: Surface Outputs는 0.3m sparse volume head의 후처리가 아니라 별도 dense BEV branch.
 ```
 
 ### D077: occupancy + surface joint train
@@ -1788,6 +1870,8 @@ phases/phase_06_surface_geometry/src/surface_metrics.py
 ```python
 def surface_mae(z_pred, z_gt, valid): ...
 def valid_accuracy(valid_logit, valid): ...
+def traversability_error(cost_pred, cost_gt, valid): ...
+def drop_risk_auc(drop_logit, drop_gt, valid): ...
 ```
 
 ### D080: Phase 06 report
@@ -1796,7 +1880,8 @@ def valid_accuracy(valid_logit, valid): ...
 
 ```text
 surface head가 occupancy와 다른 이유
-z_surface / valid / uncertainty 결과
+z_surface / valid / uncertainty / traversability_cost / drop_risk 결과
+Surface Outputs는 0.3m sparse volume head가 아니라 별도 dense BEV branch임을 기록
 ```
 
 검증:
@@ -1815,7 +1900,8 @@ pytest phases/phase_06_surface_geometry/tests -q
 
 ```text
 Tesla/PanoOcc-style 0.6m 3D temporal(z 유지, align+concat+3D residual conv, NOT attention)을
-구현하고, per-voxel flow head(vx,vy,vz)를 붙인다.
+구현하고, Occupancy Flow Head의 0.6m coarse motion seed(O_motion_0.6)를 만든다.
+최종 flow는 Phase 08에서 O_occ_fine 이후 확정되는 pred_heavy_mask 위의 [N_heavy] readout/refine으로 낸다.
 (ViewFormer z-squeeze BEV temporal은 architecture에서 폐기됨 -> 사용하지 않는다.)
 ```
 
@@ -2000,6 +2086,7 @@ phases/phase_07_temporal_flow/src/model_temporal.py
 0.6m 3D feature (z 유지)
 -> 3D voxel memory align + concat + 3D residual conv
 -> enhanced 0.6m 3D feature
+-> O_motion_0.6 coarse motion seed (vx/vy/vz + dynamic seed)
 -> decoder
 ```
 
@@ -2019,7 +2106,7 @@ pose delta
 flow target
 ```
 
-### D090: DynamicFlowHead
+### D090: Occupancy Flow Head coarse seed + readout skeleton
 
 만들 파일:
 
@@ -2031,10 +2118,13 @@ phases/phase_07_temporal_flow/tests/test_flow_head.py
 구현:
 
 ```python
-class DynamicFlowHead(nn.Module):
-    # per-voxel: dynamic logit
-    # per-voxel 3D flow: vx, vy, vz   (motion은 0.6m 3D temporal에서, 0.3m로 broadcast)
-    # z 유지 덕에 vz(수직 속도)까지 산출 가능
+class OccupancyFlowHead(nn.Module):
+    # branch A: F_0.6_temporal -> O_motion_0.6 dense coarse seed
+    #   dynamic_seed_logit + coarse vx, vy, vz
+    # branch B skeleton: pred_heavy_mask voxel에 seed + F_0.3_sparse를 gather해서
+    #   final [N_heavy] dynamic_logit + vx, vy, vz readout/refine
+    # Phase 07에서는 branch A와 gather/readout interface까지만 toy로 만든다.
+    # 실제 pred_heavy_mask는 Phase 08 O_occ_fine 이후 연결한다.
 ```
 
 ### D091: flow loss
@@ -2049,7 +2139,16 @@ phases/phase_07_temporal_flow/src/flow_losses.py
 
 ```python
 def dynamic_bce_loss(...): ...
-def flow_smooth_l1_loss(flow_pred, flow_gt, mask): ...
+def flow_coarse_seed_loss(o_motion_06, flow_gt_06, valid_flow_seed_mask): ...
+def flow_fine_readout_loss(flow_pred_heavy, flow_gt_heavy, valid_flow_mask): ...
+```
+
+검증:
+
+```text
+L_flow_coarse_seed는 0.6m dense seed에 적용.
+L_flow_fine_readout은 [N_heavy] readout에만 적용.
+valid_flow_mask 밖(정적/저신뢰/occluded)은 ignore.
 ```
 
 ### D092: flow one-batch overfit
@@ -2064,6 +2163,7 @@ phases/phase_07_temporal_flow/scripts/train_flow_one_batch.py
 
 ```text
 moving cube flow 방향 학습
+0.6m O_motion_0.6 seed가 먼저 맞고, toy pred_heavy_mask gather/readout이 shape를 유지
 ```
 
 ### D093: flow visualization
@@ -2094,6 +2194,7 @@ no temporal
 
 ```text
 loss / IoU / flow error 비교 (특히 vz가 살아나는지)
+O_motion_0.6 coarse seed loss와 [N_heavy] readout loss를 분리 기록
 ```
 
 ### D095: Phase 07 report
@@ -2108,7 +2209,9 @@ pytest phases/phase_07_temporal_flow/tests -q
 
 ```text
 3D voxel memory shape (z 유지)
-per-voxel flow (vx,vy,vz) head mask
+O_motion_0.6 coarse seed shape
+Occupancy Flow Head가 독립 5번째 head가 아니라 4 volume head 중 Flow Head의 내부 branch임
+[N_heavy] final flow는 Phase 08 pred_heavy_mask 이후에만 의미 있음
 가장 어려운 점
 ```
 
@@ -2121,10 +2224,21 @@ per-voxel flow (vx,vy,vz) head mask
 목표:
 
 ```text
-0.6m -> 0.3m을 sparse deconv + 2단 게이트 prune(gate① 0.6m parent + gate② 0.3m child)으로
-만들고, near-surface free shell(L2)을 함께 keep한다.
-그 위에 exposed-face mask / quota keep / sparse anchor / packed Queryable MLP(occupancy 전용)를
-붙인다. (Phase 04의 dense 0.3m 프로토타입을 이 sparse 경로로 교체)
+0.6m -> 0.3m을 sparse deconv + recall-first 2단 게이트로 만든다.
+
+핵심 불변식:
+  gate① parent: high-confidence free parent만 drop.
+    occupied / mixed_surface_risk / unknown / uncertain / dynamic / planner-corridor는 keep 또는 ignore.
+  gate② child: cheap child score head가 keep/free/surface/shell-tag score를 낸다.
+  prelim_kept = child_score_keep_candidates ⊎ prelim_free_shell.
+    이것은 최종 label이 아니라 O_occ_fine을 실행할 sparse index set이다.
+  near_surface_free_shell_tag = prelim_free_shell_raw ∩ prelim_kept.
+    이것은 최종 pred_free_shell semantic을 정하는 tag다.
+  O_occ_fine 이후 6-way pred label로 완전 분할한다.
+  pred_heavy_mask = pred_occupied_surface | pred_boundary.
+    Flow / Sub-Voxel Shape / 3D Semantics / Queryable MLP branch A는 여기서만 실행한다.
+
+Phase 04의 dense 0.3m 프로토타입을 이 sparse 경로로 교체한다.
 ```
 
 ### D096: sparse deconv + gate① (0.6m parent gate, 연산량)
@@ -2139,20 +2253,24 @@ phases/phase_08_sparse_prune_queryable/tests/test_sparse_decoder.py
 구현:
 
 ```python
-def parent_gate_06m(coarse_occ_logits, threshold): ...
-    # coarse occupancy로 occupied/boundary parent만 남김
-    # free/unknown parent의 0.3m children은 "생성조차 안 함" (272k materialize 회피)
-class SparseVoxelDeconv(nn.Module): ...   # 남은 parent만 0.3m로 sparse 업샘플
+def high_conf_free_parent(coarse_cls_logits, visibility_logit, mixed_surface_risk_logit, thresholds): ...
+def parent_gate_06m(coarse_cls_logits, visibility_logit, mixed_surface_risk_logit, priority_context): ...
+    # high-confidence free parent만 drop
+    # occupied / mixed_surface_risk / unknown / uncertain parent는 keep 또는 ignore
+    # 이 시점에는 O_occ_fine 전이라 pred_boundary가 아직 없음
+class SparseVoxelDeconv(nn.Module): ...
+    # keep된 parent만 0.3m child 후보로 sparse 업샘플
 ```
 
 검증:
 
 ```text
-free/unknown parent는 0.3m child를 만들지 않는지 확인
-occupied/boundary parent만 확장되는지 확인
+clean observed-free parent의 child만 생성하지 않는지 확인.
+unknown / low-visibility / mixed_surface_risk parent가 free로 잘리지 않는지 확인.
+parent gate가 dense 0.6m feature 자체를 자르는 것이 아니라 sparse fine 가지에만 적용되는지 확인.
 ```
 
-### D097: gate② (0.3m child prune, 선명도) + near-surface free shell (L2)
+### D097: gate② child score + prelim_kept / shell-tag 분리
 
 수정 파일:
 
@@ -2163,18 +2281,27 @@ phases/phase_08_sparse_prune_queryable/src/sparse_decoder.py
 구현:
 
 ```python
-def child_prune_03m(child_occ_logits, keep_ratio=0.5): ...
-    # 확장된 child 중 빈 child 제거 -> 표면 또렷 (anti-dilation)
-def add_near_surface_free_shell(kept, occ_flag): ...
-    # 표면 인접 free child 1겹을 함께 keep (기본 ON, L2). config flag로 off 가능
+class CheapChildScoreHead(nn.Module):
+    # input: sparse 0.3m child candidate features
+    # output: keep_logit, free_logit, surface_logit, shell_tag_logit
+
+def select_child_score_keep_candidates(child_scores, mandatory_keep, quotas, soft_budget): ...
+def select_prelim_free_shell_raw(child_scores, near_surface_evidence, observed_free_evidence_03): ...
+def make_prelim_kept(child_score_keep_candidates, prelim_free_shell_raw): ...
+    prelim_free_shell = prelim_free_shell_raw - child_score_keep_candidates
+    prelim_kept = child_score_keep_candidates union_disjoint prelim_free_shell
+    near_surface_free_shell_tag = prelim_free_shell_raw & prelim_kept
+    return prelim_kept, prelim_free_shell, near_surface_free_shell_tag
 ```
 
 검증:
 
 ```text
-빈 child가 제거되어 표면이 얇게 유지되는지 (anti-dilation)
-표면 인접 free 1겹이 keep되는지 (좁은 통로 통과 판단용)
-kept = occupied 표면 + near-surface free shell 임을 확인 (occupied/free flag 구분)
+prelim_kept = child_score_keep_candidates ⊎ prelim_free_shell 인지 확인.
+prelim_free_shell은 중복 제거된 extra index set이고, semantic source가 아님을 test로 고정.
+child_score_keep_candidates 안에 이미 있던 near-surface free child도
+near_surface_free_shell_tag가 유지되는지 확인.
+keep ~0.5는 soft budget target이고 mandatory recall keep이 우선인지 확인.
 ```
 
 ### D098: prune keep + query priority score 통합
@@ -2182,25 +2309,29 @@ kept = occupied 표면 + near-surface free shell 임을 확인 (occupied/free fl
 구현:
 
 ```python
-def boundary_score(occ_logits): ...
+def surface_band_score(surface_logit_or_cheap_surface_score): ...
 def uncertainty_score(occ_logits): ...
+def mixed_surface_risk_score(mixed_surface_risk_logit): ...
+def shell_tag_score(shell_tag_logit): ...
 def dynamic_score(dynamic_logits): ...
 def near_field_score(voxel_centers): ...
 def planner_corridor_score(voxel_centers, trajectory): ...
-def compute_keep_priority(...): ...   # gate② keep 우선순위 + 이후 query budget 공용
+def thin_or_high_gradient_score(...): ...
+def compute_keep_priority(...): ...   # gate①/② keep 우선순위 + 이후 query budget 공용
 ```
 
 검증:
 
 ```text
-boundary / uncertainty / dynamic / planner 영역 score가 높음
-far-field는 keep을 더 높여 원거리 물체 보호 (프루닝 비가역, recall 우선)
+surface-band / mixed-risk / uncertainty / dynamic / planner 영역 score가 높음.
+far-field / thin-object quota가 단순 top-k에 밀려 사라지지 않음.
+priority score는 keep/drop을 돕는 cheap score이지 최종 pred label이 아님.
 ```
 
 ### D099: Pruning false-negative 방어 (v1 필수, architecture Section 8.2.1)
 
 프루닝 false negative가 가장 위험(coarse가 얇은 물체 free 오판 시 0.3m 복구 불가, 비가역).
-v1.5가 아니라 v1부터 5가지 전부 넣는다.
+v1.5가 아니라 v1부터 7가지 전부 넣는다.
 
 구현:
 
@@ -2210,14 +2341,20 @@ v1.5가 아니라 v1부터 5가지 전부 넣는다.
 def quota_keep(category_scores, quotas): ...   # 3. category quota
 # 4. GT-guided warmup (초기 GT occupied parent 강제 keep)
 # 5. soft / straight-through top-k (keep에 gradient)
+# 6. gate② mandatory keep target
+def gate2_keep_loss(keep_logit, keep_target, keep_weight): ...        # L_gate2_keep
+# 7. gate② shell-tag supervision
+def gate2_shell_tag_loss(shell_tag_logit, shell_tag_target, mask): ... # L_gate2_shell_tag
 ```
 
 검증:
 
 ```text
 prune_recall(GT occupied 생존율) 측정 - 핵심 지표
-얇은 물체 toy에서 coarse가 약해도 recall 유지
+observed surface-band / near-surface observed free shell recall 측정
+얇은 물체 toy에서 coarse/cheap score가 약해도 recall 유지
 quota별 selected count / 카테고리별 최소 keep 보장
+L_gate2_keep은 "살릴지", L_gate2_shell_tag는 "shell semantic tag인지"를 분리해 학습
 중복 제거 확인
 ```
 
@@ -2226,33 +2363,56 @@ quota별 selected count / 카테고리별 최소 keep 보장
 구현:
 
 ```python
-def assign_query_budget(selected_voxels, distance, planner_score, dynamic_score): ...
+def make_lod_budget_policy(distance_bins, planner_weight, dynamic_weight, hard_caps): ...
+def assign_query_budget_after_pred(pred_heavy_voxels, budget_policy, planner_score, dynamic_score): ...
 ```
 
 검증:
 
 ```text
+D100에서는 아직 pred_heavy_mask가 없으므로 budget policy만 독립 test.
+D102 이후 pred_heavy_voxels에 적용해 M_i를 배정한다.
 near/planner/dynamic은 M_i가 큼
 far/static은 M_i가 작음
+N_kept / K_total / Q_total hard cap 초과 시 낮은 priority부터 fine/query 실행을 줄이되,
+제외된 voxel을 free로 간주하지 않고 coarse unknown/occupied-risk fallback으로 degrade
 ```
 
-### D101: exposed face mask (kept AND occupied 기준, N1)
+### D101: O_occ_fine 6-way pred label + exposed face mask
 
 구현:
 
 ```python
-def compute_exposed_faces(kept_idx, occ_flag, coarse_occ): ...
-    # neighbor가 kept AND occupied -> not exposed (occupied 표면끼리 맞닿음)
-    # neighbor가 kept free shell    -> exposed-to-free (fine 확정 노출면)
-    # neighbor가 pruned             -> 부모 0.6m coarse로 free/unknown/occupied 구분
+class SparseFineOccupancyHead(nn.Module):
+    # input: F_0.3_sparse on prelim_kept
+    # output: occ_logit + surface_band_logit on [N_kept]
+
+def make_six_way_pred_labels(occ_logit, surface_band_logit, visibility, near_surface_free_shell_tag): ...
+    # pred_occupied_surface
+    # pred_boundary
+    # pred_visibility_frontier
+    # pred_free_shell
+    # pred_free_kept
+    # pred_uncertain_kept
+
+def compute_pred_heavy_mask(pred_labels): ...
+    return pred_occupied_surface | pred_boundary
+
+def compute_exposed_faces(pred_heavy_idx, pred_labels_6way, coarse_fallback): ...
+    # neighbor가 pred_occupied_surface 또는 pred_boundary solid면 not exposed
+    # neighbor가 pred_free_shell / pred_free_kept이면 exposed-to-free 후보
+    # neighbor가 pred_visibility_frontier / pred_uncertain_kept이면 unknown/occlusion 후보
+    # neighbor가 pruned이면 부모 0.6m coarse/visibility fallback으로 판정
 ```
 
 검증:
 
 ```text
-표면이 near-surface free shell과 맞닿는 면이 exposed로 잡히는지 (N1: kept != occupied 주의)
-pruned neighbor는 부모 coarse occupancy로 판정되는지
-free/unknown neighbor 방향이 exposed인지 확인
+prelim_kept 전체가 6-way pred label 중 정확히 하나로 분할되는지 확인.
+pred_heavy_mask = pred_occupied_surface | pred_boundary인지 확인.
+near_surface_free_shell_tag가 있어도 O_occ_fine이 occupied로 보면 pred_occupied_surface가 되는지 확인.
+child_score_keep_candidates에서 온 voxel이라도 fine이 free이고 shell tag가 있으면 pred_free_shell인지 확인.
+exposed-face 계산이 단순 kept 기준이 아니라 6-way pred label 기준인지 확인.
 ```
 
 ### D101a: Sub-Voxel Shape Information Head (architecture Section 9.3)
@@ -2268,8 +2428,8 @@ phases/phase_08_sparse_prune_queryable/tests/test_subvoxel_shape_head.py
 
 ```python
 class SubVoxelShapeHead(nn.Module):
-    # input:  F_0.3_sparse kept (occupied 표면) voxel feature + exposed_face_mask(D101)
-    # output (per kept occupied voxel):
+    # input:  F_0.3_sparse[pred_heavy_mask] + exposed_face_mask(D101)
+    # output (per pred_heavy voxel, [N_heavy]):
     #   exposed_face_logits: 6
     #   face_surface_offset: 6   (각 exposed face -> voxel 내부 surface까지 normalized [0,1])
     #   local_normal: 3
@@ -2290,8 +2450,9 @@ zero exposed face(내부) -> heavy local query 생략
 검증:
 
 ```text
-출력이 kept occupied voxel 위에서만 계산된다 (free shell/pruned 제외).
-shape_code가 D104 anchor / D105 QueryableMLP 입력으로 전달된다.
+출력이 pred_heavy_mask(occupied surface + boundary) 위에서만 계산된다.
+pred_free_shell / pred_free_kept / pred_visibility_frontier / pred_uncertain_kept / pruned는 제외.
+shape_code가 D104 anchor / D105 Queryable branch A surface-shell MLP 입력으로 전달된다.
 offset이 [0,1](또는 [-0.5,0.5]) 범위, normal이 단위 vector에 가깝다.
 exposed face 없는 interior voxel은 query budget이 0에 가깝다.
 ```
@@ -2316,8 +2477,8 @@ phases/phase_08_sparse_prune_queryable/tests/test_semantics_head.py
 
 ```python
 class SemanticsHead(nn.Module):
-    # input:  F_0.3_sparse kept (occupied 표면) voxel feature
-    # output: [N_kept] x N_class   (sparse, kept voxel별 semantic logit)
+    # input:  F_0.3_sparse[pred_heavy_mask]
+    # output: [N_heavy] x N_class   (sparse, pred_heavy voxel별 semantic logit)
 ```
 
 권장 class (실내+실외 비도로):
@@ -2331,10 +2492,11 @@ curb/barrier, vegetation, other static
 검증:
 
 ```text
-semantic은 occupied/surface-near voxel 위에서만 계산/loss 적용.
-free/unknown 영역에 semantic을 강제하지 않는다 (noisy supervision 방지).
-출력 shape [N_kept] x N_class, NaN 없음.
-Queryable은 occupancy 전용이므로 semantic 질의는 이 voxel-level head에서만 제공(N7-B).
+semantic은 pred_heavy_mask 위에서 실행하고, loss는 valid_semantic_mask에만 적용.
+pred_boundary 전체에 강한 semantic label을 주지 않는다.
+pred_free_shell / pred_free_kept / pred_visibility_frontier / pred_uncertain_kept 영역에 semantic을 강제하지 않는다.
+출력 shape [N_heavy] x N_class, NaN 없음.
+Queryable은 surface-shell occupancy용 branch A만 두므로 semantic 질의는 이 voxel-level head에서만 제공(N7-B).
 ```
 
 기록:
@@ -2354,7 +2516,9 @@ phases/phase_08_sparse_prune_queryable/src/query_generation.py
 구현:
 
 ```python
-def make_initial_queries(exposed_faces, budget): ...
+def make_initial_queries(pred_heavy_idx, exposed_faces, shape_uncertainty, budget): ...
+    # Queryable MLP branch A(pred_heavy_mask)용 query만 생성
+    # pred_free_shell / pred_free_kept는 observed-free fallback 분기라 MLP query를 만들지 않음
 ```
 
 ### D103: pack variable queries
@@ -2370,6 +2534,7 @@ def pack_query_lists(query_lists): ...
 ```text
 q_local_packed: Q x 3
 query_offsets: K + 1
+branch_id가 모두 A(pred_heavy_mask)인지 확인
 ```
 
 ### D104: SparseLocalAnchor
@@ -2383,26 +2548,44 @@ phases/phase_08_sparse_prune_queryable/src/sparse_anchor.py
 구현:
 
 ```python
-def gather_03m_features(feat, selected_idx): ...   # F_0.3_sparse kept voxel feature
+def gather_03m_features(feat_sparse, selected_pred_heavy_idx): ...
+    # F_0.3_sparse는 prelim_kept의 sparse feature.
+    # Queryable branch A에서는 pred_heavy voxel feature만 gather.
 class SparseLocalAnchor(nn.Module): ...
 ```
 
-### D105: QueryableMLP (occupancy 전용)
+### D105: Queryable Interface (surface_shell_prob + collision_state)
 
 만들 파일:
 
 ```text
 phases/phase_08_sparse_prune_queryable/src/queryable_mlp.py
+phases/phase_08_sparse_prune_queryable/src/collision_state.py
 ```
 
 구현:
 
 ```python
-class QueryableMLP(nn.Module):
-    # F_query(F_0.3_sparse) + q_local + PE + coarse logits
-    # 출력: continuous occupancy / uncertainty (occupancy 전용)
-    # semantic은 voxel-level 3D Semantics Head에서만 (Tesla 2-MLP 중 occupancy MLP만 채택)
-    # pruned 영역 query는 부모 0.6m coarse occupancy로 보수적 즉답 (MLP 생략)
+class QueryableSurfaceShellMLP(nn.Module):
+    # branch A only: pred_heavy_mask voxel
+    # input: F_query(F_0.3_sparse) + shape_code + exposed_face context + q_local + PE
+    # output: surface_shell_prob / surface_shell_uncertainty
+    # semantic query 없음. semantic은 voxel-level 3D Semantics Head에서만 제공.
+
+def collision_state_from_fallback(query_point, pred_label, coarse_occ, visibility, observed_free_evidence_06, observed_free_evidence_03): ...
+    # A: pred_heavy_mask -> MLP surface_shell_prob + coarse/visibility/solid fallback
+    # B1: pred_free_shell -> child-level observed_free_evidence_03 + NOT solid_interior_veto 필요
+    # B2: pred_free_kept  -> parent-level observed_free_evidence_06 + coarse_free_conf 필요
+    # C: pred_visibility_frontier | pred_uncertain_kept -> coarse/visibility fallback
+    # D: pruned -> coarse/visibility fallback
+```
+
+주의:
+
+```text
+surface_shell_prob를 collision probability로 직접 해석하지 않는다.
+planner는 collision_state == observed_free일 때만 통과 가능으로 본다.
+unknown / occluded / occupied-risk / uncertain은 conservative occupied 또는 high-cost다.
 ```
 
 ### D106: packed execution test
@@ -2419,8 +2602,11 @@ phases/phase_08_sparse_prune_queryable/tests/test_queryable_mlp.py
 K=32
 variable M_i
 Q=sum(M_i)
-MLP output Q x 1 (occupancy)
-pruned 영역은 coarse 즉답 경로로 빠지는지 확인
+MLP output Q x 2 (surface_shell_prob, uncertainty)
+branch A만 MLP를 실행하는지 확인
+branch B(pred_free_shell/pred_free_kept)는 child/parent observed-free evidence가 있을 때만 free 즉답
+branch C/D는 coarse/visibility fallback으로 빠지는지 확인
+observed-free evidence가 없으면 free로 반환하지 않는지 확인
 ```
 
 ### D107: boundary search
@@ -2434,8 +2620,16 @@ phases/phase_08_sparse_prune_queryable/src/query_generation.py
 구현:
 
 ```python
-def find_sign_change_pairs(query_points, occ_probs): ...
+def find_sign_change_pairs(query_points, surface_shell_prob): ...
 def refine_boundary_bisection(...): ...
+```
+
+주의:
+
+```text
+v1 Queryable output은 전역 dense 3D feature interpolation이 아니라 sparse feature 기반 piecewise-continuous surface-shell field다.
+boundary search는 pred_heavy_mask branch A 안에서만 사용한다.
+분기 B/C/D에는 MLP boundary search를 적용하지 않는다.
 ```
 
 ### D108: fine overlay representation
@@ -2450,33 +2644,39 @@ phases/phase_08_sparse_prune_queryable/src/fine_overlay.py
 
 ```python
 class SparseSurfaceRepresentation:
-    # kept voxel idx (occupied 표면 + near-surface free shell)
-    # F_0.3_sparse feature + Sub-Voxel Shape code / offset / normal
+    # prelim_kept index set
+    # 6-way pred labels
+    # pred_heavy_idx
+    # near_surface_free_shell_tag
+    # F_0.3_sparse feature
+    # Sub-Voxel Shape code / offset / normal on [N_heavy]
+    # Semantics on [N_heavy]
     # local boundary samples
 ```
 
 설계 주의:
 
 ```text
-이것은 architecture 문서의 최종 30cm 표현(sparse deconv + 2단 게이트 prune +
-near-surface free shell) 위에 올라가는 sparse surface representation이다.
-"selected voxel -> local context(shape code/offset) -> 임의 점 occupancy 평가"
-인터페이스로 추상화해, Queryable MLP / Sub-Voxel Shape Head가 공유하도록 한다.
+이것은 architecture 문서의 최종 30cm sparse candidate 표현 위에 올라가는 runtime representation이다.
+"prelim_kept -> O_occ_fine 6-way label -> pred_heavy branch A query / fallback branch B-C-D"
+인터페이스로 추상화해, Queryable MLP / Sub-Voxel Shape Head / planner fallback이 공유하도록 한다.
 (Gaussian refinement는 현재 architecture에 없다 -> 도입하지 않는다.)
 ```
 
-### D109: refinement toy training
+### D109: Queryable / surface-shell toy training
 
 만들 파일:
 
 ```text
-phases/phase_08_sparse_prune_queryable/scripts/train_refinement_toy.py
+phases/phase_08_sparse_prune_queryable/scripts/train_queryable_toy.py
 ```
 
 검증:
 
 ```text
-selected boundary voxel 내부 query loss 감소
+pred_heavy_mask branch A query에서 L_query_surface_shell / L_query_uncertainty 감소
+observed-free local sample이 surface_shell_prob를 낮추는지 확인
+solid interior / occluded / 미관측 query를 free negative로 강제하지 않는지 확인
 ```
 
 ### D110: Phase 08 report
@@ -2490,12 +2690,17 @@ pytest phases/phase_08_sparse_prune_queryable/tests -q
 기록:
 
 ```text
-2단 게이트(parent/child) + near-surface free shell 동작
+gate① high-conf free parent drop 규칙
+gate② prelim_kept / prelim_free_shell / near_surface_free_shell_tag 분리
+6-way pred label과 pred_heavy_mask
+L_gate2_keep / L_gate2_shell_tag 분리
+exposed-face mask
 Sub-Voxel Shape Head(D101a) 출력(offset/normal/shape_code/thinness)
-3D Semantics Head(D101b) 출력
+3D Semantics Head(D101b) 출력([N_heavy])
 K_total / Q_total
 packed MLP latency
-이로써 4 volume head(Occupancy/Flow/Sub-Voxel Shape/3D Semantics)가 모두 구현됨
+surface_shell_prob와 collision_state를 분리한 이유
+이로써 4 volume head(Occupancy/Flow/Sub-Voxel Shape/3D Semantics)와 Queryable interface가 모두 구현됨
 ```
 
 ---
@@ -2541,18 +2746,26 @@ final_occnet_v1/src/occnet_v1/model.py
 class OccNetV1(nn.Module):
     def forward(batch):
         return {
-          "occ_coarse": ...,   # 0.6m free/unknown/occupied/visibility
-          "occ_fine": ...,     # 0.3m sparse kept (occupied 표면)
-          "surface": ...,      # z-flatten
-          "dynamic": ...,
-          "flow": ...,         # vx,vy,vz
-          "subvoxel_shape": ...,  # offset/normal/shape_code/thinness (D101a)
-          "semantics": ...,    # voxel-level (D101b)
-          "queryable": ...,    # occupancy 전용
+          "occ_coarse": ...,        # 0.6m occupied/free/unknown/visibility/mixed_surface_risk
+          "aux_depth": ...,         # low-res depth/confidence/free-space evidence
+          "o_motion_06": ...,       # Flow Head 내부 0.6m coarse motion seed
+          "prelim_kept": ...,       # child_score_keep_candidates ⊎ prelim_free_shell
+          "near_surface_free_shell_tag": ...,
+          "occ_fine": ...,          # [N_kept] occ_logit + surface_band_logit
+          "pred_labels_6way": ...,  # 6-way pred label
+          "pred_heavy_mask": ...,   # pred_occupied_surface | pred_boundary
+          "flow": ...,              # [N_heavy] vx,vy,vz + dynamic
+          "subvoxel_shape": ...,    # [N_heavy] offset/normal/shape_code/thinness
+          "semantics": ...,         # [N_heavy] voxel-level semantics
+          "surface": ...,           # dense BEV Surface Outputs
+          "queryable": ...,         # surface_shell_prob + collision_state interface
         }
 # forward 내부 순서: ... -> dense deconv 1.2->0.6 -> pre-temporal refine(D081a)
-#  -> 0.6m 3D temporal + flow -> coarse occ -> sparse deconv+2단 게이트(+free shell)
-#  -> occupancy fine / subvoxel shape / semantics / surface heads -> queryable
+#  -> 0.6m 3D temporal -> O_motion_0.6 + coarse occ/mixed risk
+#  -> sparse deconv + gate①/② -> prelim_kept + near_surface_free_shell_tag
+#  -> O_occ_fine -> 6-way pred label -> pred_heavy_mask
+#  -> Flow/Shape/Semantics on [N_heavy] + Surface Outputs branch
+#  -> Queryable branch A MLP + branch B/C/D collision_state fallback
 ```
 
 ### D113: final shape test
@@ -2568,6 +2781,9 @@ final_occnet_v1/tests/test_model_shape.py
 ```text
 batch 1, 2 forward
 all output keys
+prelim_kept와 pred_labels_6way의 개수 일치
+Flow/Shape/Semantics 출력 첫 차원이 N_heavy인지 확인
+Queryable MLP query가 pred_heavy_mask branch A에서만 생성되는지 확인
 ```
 
 ### D114: unified losses
@@ -2581,7 +2797,47 @@ final_occnet_v1/src/occnet_v1/losses.py
 구현:
 
 ```python
-L_total = L_occ + lambda_surface*L_surface + lambda_flow*L_flow + lambda_refine*L_refine
+L_total = (
+    L_occ_coarse_cls
+    + L_occ_coarse_visibility
+    + L_coarse_mixed_surface_risk
+    + L_gate2_keep
+    + L_gate2_shell_tag
+    + L_occ_fine
+    + L_surface_band
+    + L_heavy_recall
+    + L_heavy_mask
+    + L_flow_coarse_seed
+    + L_flow_fine_readout
+    + L_dynamic
+    + L_shape_exposed_face
+    + L_shape_offset
+    + L_shape_normal
+    + L_shape_uncertainty
+    + L_query_surface_shell
+    + L_query_uncertainty
+    + L_depth
+    + L_depth_conf
+    + L_free_space_evidence
+    + L_semantic
+    + L_surface_valid
+    + L_surface_z
+    + L_surface_slope_or_normal
+    + L_step_height
+    + L_traversability_cost
+    + L_drop_risk
+    + L_surface_sparse_consistency
+)
+```
+
+검증:
+
+```text
+각 loss의 정의역이 맞는지 확인:
+  O_occ_fine / L_occ_fine은 [N_kept] 전체.
+  Flow/Shape/Semantics loss는 [N_heavy]에서 실행하되 valid_*_mask로 supervise.
+  Queryable loss는 branch A surface-shell query에만 적용.
+  collision_state는 직접 CE로 학습하지 않고 fallback rule/unit test로 검증.
 ```
 
 ### D115: final training script
@@ -2610,9 +2866,15 @@ final_occnet_v1/src/occnet_v1/metrics.py
 
 ```text
 occupancy IoU
+heavy mask recall
+prune recall(GT occupied / surface-band / free-shell)
 surface MAE
+traversability / drop-risk metric
 flow endpoint error
-active selection count
+semantic accuracy(valid_semantic_mask)
+gate selected count / N_kept / N_heavy
+Queryable surface-shell calibration
+collision_state conservative-free violation count
 ```
 
 ### D117: visualization package
@@ -2628,8 +2890,11 @@ final_occnet_v1/scripts/visualize_outputs.py
 ```text
 occupancy slices
 surface height
+traversability / drop-risk map
 flow BEV arrows
-active mask map
+pred_heavy_mask / exposed-face mask map
+6-way pred label map
+Queryable branch A/B/C/D debug overlay
 ```
 
 ### D118: config ablation switches
@@ -2643,10 +2908,23 @@ final_occnet_v1/configs/tiny.yaml
 추가:
 
 ```yaml
-use_surface: true
-use_temporal: true
-use_flow: true
-use_refinement: true
+model:
+  use_surface: true
+  use_aux_depth: true
+  use_temporal: true
+  use_flow: true
+  use_sparse_prune: true
+  use_near_surface_free_shell: true
+  use_gate2_keep_loss: true
+  use_gate2_shell_tag_loss: true
+  use_queryable_surface_shell: true
+  use_collision_state_fallback: true
+  use_semantic_head: true
+  temporal_fallback_12m: false
+runtime:
+  k_total: 512
+  q_total: 4096
+  soft_keep_budget: 0.5
 ```
 
 ### D119: end-to-end small validation
@@ -2698,13 +2976,17 @@ temporal (0.6m 3D)
 dense deconv (1.2m->0.6m)
 sparse deconv + 2단 게이트 prune (0.6m->0.3m)
 occupancy head (coarse dense + sparse fine)
+gate② child score + L_gate2_keep / L_gate2_shell_tag
+6-way pred label + pred_heavy_mask generation
 sub-voxel shape head (D101a)
 3D semantics head (D101b)
-surface head (z-flatten)
-flow head (vx,vy,vz)
-active/exposed-face mask
+Surface Outputs head (z-flatten + geometry-derived risk)
+Occupancy Flow Head (O_motion_0.6 seed + [N_heavy] readout)
+exposed-face mask
 quota keep
-packed Queryable MLP (occupancy 전용)
+auxiliary depth/free-space evidence head
+packed Queryable branch A surface-shell MLP
+collision_state fallback branch B/C/D
 ```
 
 ### D122: K/Q latency table
@@ -2714,6 +2996,8 @@ packed Queryable MLP (occupancy 전용)
 ```text
 K=512, 1024, 2048
 average M_i=4, 8, 16
+N_kept / N_heavy / Q_total을 함께 기록
+branch A MLP latency와 branch B/C/D fallback latency를 분리
 ```
 
 기록:
@@ -2737,19 +3021,26 @@ phase별 peak memory 기록
 
 ```text
 A0 occupancy only
-A1 + surface
-A2 + temporal
-A3 + flow
+A1 + mixed_surface_risk + recall-first gate
+A2 + auxiliary depth/free-space evidence
+A3 + Surface Outputs head
 ```
 
-### D125: ablation A4-A6
+### D125: ablation A4-A7
+
+기록:
+
+```text
+phases/phase_10_runtime_final_report/reports/ablation_a4_a7.md
+```
 
 실험:
 
 ```text
-A4 + active mask
-A5 + sparse anchor
-A6 + packed adaptive query
+A4 + temporal + O_motion_0.6
+A5 + Occupancy Flow [N_heavy] readout
+A6 + Sub-Voxel Shape / 3D Semantics on pred_heavy_mask
+A7 + Queryable surface_shell_prob + collision_state fallback
 ```
 
 ### D126: 20 FPS blocker 분석
@@ -2759,6 +3050,8 @@ A6 + packed adaptive query
 ```text
 가장 느린 top 3 stage
 가장 memory 큰 top 3 tensor
+N_kept / N_heavy / Q_total이 예산을 넘는 조건
+fallback으로 품질을 낮춘 frame 수
 20 FPS 달성 가능성
 ```
 
@@ -2792,6 +3085,8 @@ model overview
 how to train
 how to visualize
 known limitations
+prelim_kept vs 6-way pred label 용어표
+surface_shell_prob vs collision_state 용어표
 ```
 
 ### D129: final report
@@ -2809,6 +3104,9 @@ phases/phase_10_runtime_final_report/reports/final_report.md
 미완료
 metric
 latency
+N_kept / N_heavy / Q_total budget
+prune recall / heavy recall
+collision_state conservative-free violation
 visual examples
 다음 단계
 ```
@@ -2832,11 +3130,12 @@ temporal v1.5 강화 (architecture Section 7)
   - 장기 누적 기억(Tesla Temporal Context, GRU/EMA식) 추가
   - 0.3m residual flow head (full 0.3m temporal은 계속 금지)
 prune v1.5 강화 (architecture Section 8.2)
-  - 카테고리별 quota keep, near-surface free shell 튜닝
+  - v1의 category quota / shell-tag supervision은 유지
+  - per-class quota 비율 튜닝, hard-negative mining, active learning 보강
 deformable image re-query (P3, 1 round) 실험 (선택)
 flow-aware dynamic feature correction
 (선택 연구) Gaussian refinement (GaussianFormer 계열)
-  - 현재 architecture에는 없음. Phase 08 packed Queryable MLP와 ablation 비교용 연구 트랙
+  - 현재 architecture에는 없음. Phase 08 Queryable branch A surface-shell MLP와 ablation 비교용 연구 트랙
 camera-only GT auto-labeling pipeline (architecture 문서 Section 19)
   - Stage A: MapAnything / MASt3R 기반 metric 재구성
     (vanilla DUSt3R 직접 사용 금지: scale 모호 / pair 단위 추론 /
@@ -2863,6 +3162,9 @@ one-batch overfit이 되는가?
 NaN이 없는가?
 batch size 1과 2 모두 동작하는가?
 시각화가 있는가?
+prelim_kept와 pred_* label을 섞어 쓰지 않았는가?
+Flow/Shape/Semantics가 [N_heavy]에서만 실행되는가?
+free로 반환하는 모든 경로에 observed-free evidence가 있는가?
 notes.md에 오늘 결과가 기록되었는가?
 ```
 
@@ -2899,11 +3201,14 @@ AI에게 요청할 때는 항상 다음 형식을 쓴다.
 ```text
 phases/phase_08_sparse_prune_queryable/src/sparse_decoder.py에
 sparse deconv + 2단 게이트 prune을 만들어줘.
-입력은 0.6m coarse occupancy logits(B x 1 x 100 x 34 x 10)와 0.6m feature야.
-게이트①: free/unknown parent의 0.3m children을 생성하지 마(272k materialize 금지).
-게이트②: 확장된 child 중 빈 child를 keep ratio ~0.5로 prune하고,
-         표면 인접 free child 1겹은 함께 keep해(near-surface free shell, L2).
-출력은 kept voxel index + F_0.3_sparse feature야.
+입력은 0.6m coarse occupancy/visibility/mixed_surface_risk logits와 0.6m feature야.
+게이트①: high-confidence free parent만 0.3m child 생성을 생략해.
+         unknown / uncertain / mixed_surface_risk parent는 free로 자르지 마.
+게이트②: cheap child score head가 keep/free/surface/shell-tag score를 내고,
+         child_score_keep_candidates와 prelim_free_shell_raw를 만든 뒤
+         prelim_kept = child_score_keep_candidates ⊎ prelim_free_shell을 만들어.
+         near_surface_free_shell_tag는 prelim_free_shell_raw ∩ prelim_kept로 유지해.
+출력은 prelim_kept index + F_0.3_sparse feature + near_surface_free_shell_tag야.
 dense 0.3m feature volume은 만들면 안 돼.
 tests/test_sparse_decoder.py도 작성해줘.
 ```
@@ -2921,6 +3226,7 @@ D037:
 
 D066:
   RoadBEV problem definition + road elevation output
+  (Road semantics는 참고만, v1 Surface Outputs는 geometry-derived risk 중심)
 
 D081:
   PanoOcc temporal encoder (align+concat+3D conv, z 유지)
@@ -2949,8 +3255,10 @@ loss
 synthetic dataset에서 end-to-end 학습 가능
 one-batch overfit 가능
 occupancy / surface / flow visualization 가능
-active mask + quota Top-K 동작
-packed Queryable MLP 동작
+prelim_kept / 6-way pred label / pred_heavy_mask 동작
+L_gate2_keep + L_gate2_shell_tag 동작
+packed Queryable branch A surface-shell MLP와 collision_state fallback 동작
+auxiliary depth/free-space evidence가 observed-free 판정에 연결됨
 runtime profiling 가능
 ```
 

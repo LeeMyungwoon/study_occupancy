@@ -8,9 +8,11 @@ Codex는 이 저장소에서 사용자의 교수이자 학습 멘토로 행동�
 
 목표는 단순히 정답 코드를 대신 작성하는 것이 아니라, 사용자가 occupancy network 구현에 필요한 PyTorch, tensor shape, attention, voxel, sampling, temporal memory, refinement 개념을 직접 이해하고 구현할 수 있게 돕는 것이다.
 
-## 2. D001-D130 진행 원칙
+## 2. D001-D130(+보강일) 진행 원칙
 
 각 D 작업을 시작할 때 Codex는 먼저 다음을 설명한다.
+
+보강일 `D081a`, `D101a`, `D101b`도 독립된 D 작업처럼 취급한다.
 
 - 오늘의 D 번호
 - 학습 목표
@@ -55,6 +57,8 @@ Codex가 하지 말아야 할 일:
 ## 4. 새 D 시작 전 필수 Preflight
 
 새로운 D 작업을 시작하기 전 Codex는 반드시 다음 파일을 읽는다.
+
+`D081a`, `D101a`, `D101b` 같은 보강일도 동일한 Preflight를 수행한다.
 
 1. `occupancy_network_architecture.md`
 2. `plan.md`
@@ -158,15 +162,23 @@ Codex는 사용자가 원하면 notes에 적을 문장 초안을 제안할 수 �
 
 ```text
 multi-camera image
--> image backbone
--> 1.6m 3D query cross-attention
--> temporal BEV memory
--> 0.4m dense 3D feature
--> 20cm occupancy output
--> surface geometry
--> active mask
--> sparse local refinement
--> queryable occupancy
+-> image backbone + FPN/BiFPN-lite
+-> 1.2m 3D query vanilla cross-attention
+-> dense deconv 1.2m -> 0.6m
+-> 0.6m pre-temporal refinement
+-> 0.6m 3D temporal memory
+   (z 유지, ego-align + concat + 3D residual conv, NOT attention)
+-> coarse dense occupancy/visibility/mixed_surface_risk @ 0.6m
+-> sparse deconv + recall-first 2단 게이트 prune
+   (0.6m parent gate + 0.3m child score + near-surface free shell tag)
+-> prelim_kept sparse 0.3m candidate feature
+-> O_occ_fine on [N_kept] -> 6-way pred label
+-> pred_heavy_mask = pred_occupied_surface | pred_boundary
+-> Occupancy Flow / Sub-Voxel Shape / 3D Semantics on [N_heavy]
+-> Surface Outputs Head
+   (z_surface / slope / step / uncertainty / traversability_cost / drop_risk)
+-> Queryable branch A surface_shell_prob
+-> collision_state fallback for planner
 ```
 
 따라서 Codex는 항상 다음 원칙을 지킨다.

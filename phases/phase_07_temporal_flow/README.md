@@ -1,7 +1,7 @@
 # Phase 07 - Temporal Memory and Flow
 
 기간: D081-D095  
-목표: Tesla/PanoOcc-style 0.6m 3D temporal(z 유지, align+concat+3D residual conv, NOT attention)과 `Dynamic / Flow Head`(per-voxel vx,vy,vz)를 구현한다.
+목표: Tesla/PanoOcc-style 0.6m 3D temporal(z 유지, align+concat+3D residual conv, NOT attention)과 Occupancy Flow Head 내부의 `O_motion_0.6` coarse motion seed를 구현한다. 최종 flow는 Phase 08에서 O_occ_fine 이후 확정되는 `pred_heavy_mask` 위의 `[N_heavy]` readout/refine으로 낸다.
 
 이 phase의 목적은 단순히 프레임을 여러 장 넣는 것이 아니다.  
 핵심은 현재 프레임의 0.6m 3D feature(z 유지)를 만들고, 과거 프레임의 3D voxel memory를 현재 ego pose 기준으로 정렬(warp)한 뒤, concat + 3D residual conv로 융합하는 것이다.
@@ -18,11 +18,16 @@ v1에서 temporal은 **z-squeeze BEV가 아니라 3D(z 유지)** 로 한다. (Vi
 4. Orin 예산 초과 시에는 1.2m 3D fallback (해상도만 한 단계 내림, 3D 유지는 동일).
 ```
 
-v1에서 flow는 다음 두 가지를 예측한다 (z 유지라 vz까지).
+v1에서 이 phase가 직접 만드는 것은 Flow Head의 0.6m coarse branch다.
 
 ```text
-dynamic_logit: B x 1 x X x Y x Z
-flow:          B x 3 x X x Y x Z  # vx, vy, vz
+O_motion_0.6:
+  dynamic_seed_logit: B x 1 x X x Y x Z
+  coarse_flow_seed:   B x 3 x X x Y x Z  # vx, vy, vz
+
+final flow:
+  Phase 08의 pred_heavy_mask 위에서 seed + F_0.3_sparse를 readout/refine
+  output: [N_heavy] x 5 또는 필요한 channel(dynamic + vx/vy/vz + confidence)
 ```
 
 ## 이 phase가 끝나면 할 수 있어야 하는 것
@@ -32,8 +37,8 @@ flow:          B x 3 x X x Y x Z  # vx, vy, vz
 2. ego pose delta로 과거 3D voxel feature를 현재 frame에 맞게 3D warp할 수 있다.
 3. 최근 N개(과거3+현재1=4)의 3D voxel memory를 queue로 관리할 수 있다.
 4. concat + 3D residual conv로 temporal 융합할 수 있다 (attention 아님).
-5. moving cube toy sequence에서 dynamic mask와 per-voxel flow(vx,vy,vz) target을 만들 수 있다.
-6. flow loss가 occupied/dynamic 영역에서만 계산되도록 만들 수 있다.
+5. moving cube toy sequence에서 O_motion_0.6 coarse seed target을 만들 수 있다.
+6. L_flow_coarse_seed와 [N_heavy] readout interface를 분리할 수 있다.
 ```
 
 ## D081 - PanoOcc / Tesla temporal 발췌 읽기
@@ -373,7 +378,8 @@ enhanced_feat_06m shape가 feat_06m과 같다 (z 유지).
 기록:
 
 ```text
-notes.md에 "temporal은 deconv 이전 0.6m 3D feature에 들어간다"라고 적는다.
+notes.md에 "temporal은 dense deconv(1.2m->0.6m) 이후,
+0.6m->0.3m sparse/final deconv 이전의 0.6m 3D feature에 들어간다"라고 적는다.
 0.3m 이후에 temporal을 넣지 않는 이유(272k voxel)도 적는다.
 ```
 
@@ -392,7 +398,8 @@ phases/phase_07_temporal_flow/tests/test_sequence_dataset.py
 moving cube sequence
 ego pose delta
 dynamic mask
-per-voxel flow target (vx, vy, vz)
+O_motion_0.6 coarse flow seed target (vx, vy, vz)
+[N_heavy] fine flow readout target placeholder
 occlusion/unknown mask optional
 ```
 
@@ -422,7 +429,7 @@ flow target은 coordinate convention이 매우 중요하다.
 v1에서는 ego/current frame 기준 flow로 통일한다.
 ```
 
-## D090 - DynamicFlowHead (per-voxel vx,vy,vz)
+## D090 - Occupancy Flow Head coarse seed + readout skeleton
 
 만들 파일:
 
@@ -434,30 +441,35 @@ phases/phase_07_temporal_flow/tests/test_flow_head.py
 구현:
 
 ```python
-class DynamicFlowHead(nn.Module):
+class OccupancyFlowHead(nn.Module):
     """
-    input:  B x C x X x Y x Z   (0.6m 3D temporal feature)
-    output:
-      dynamic_logit: B x 1 x X x Y x Z
-      flow:          B x 3 x X x Y x Z   # vx, vy, vz (z 유지 덕에 vz 산출)
-    motion은 0.6m 3D에서, 출력은 0.3m sparse voxel로 broadcast (Phase 08 연결)
+    branch A:
+      input:  F_0.6_temporal, B x C x X x Y x Z
+      output: O_motion_0.6 dense coarse seed
+              dynamic_seed_logit + coarse vx, vy, vz
+
+    branch B skeleton:
+      Phase 08 이후 pred_heavy_mask voxel에
+      O_motion_0.6 seed + F_0.3_sparse를 gather해
+      final [N_heavy] dynamic_logit + vx, vy, vz를 readout/refine한다.
     """
 ```
 
 검증:
 
 ```text
-dynamic output shape 확인
-flow output shape 확인 (3 channel: vx,vy,vz)
-flow 값에 NaN이 없다.
-flow head가 occupancy head와 독립적으로 꺼질 수 있다.
+O_motion_0.6 dynamic seed shape 확인
+O_motion_0.6 coarse flow seed shape 확인 (3 channel: vx,vy,vz)
+toy pred_heavy_mask gather/readout interface shape 확인
+Flow Head가 독립 5번째 head가 아니라 4 volume head 중 Flow Head의 내부 coarse branch임을 notes에 기록
 ```
 
 주의:
 
 ```text
-flow는 모든 voxel에서 학습하면 안 된다.
-occupied/dynamic/valid mask에서만 loss를 계산한다.
+coarse seed는 0.6m dense에서 supervise할 수 있다.
+최종 flow는 pred_heavy_mask 위에서 실행하되, supervise는 valid_flow_mask에만 준다.
+pred_visibility_frontier / pred_free_shell / pred_free_kept / pred_uncertain_kept에는 final flow를 두지 않는다.
 ```
 
 ## D091 - flow losses
@@ -475,7 +487,10 @@ phases/phase_07_temporal_flow/tests/test_flow_losses.py
 def dynamic_bce_loss(dynamic_logit, dynamic_gt, valid_mask=None):
     ...
 
-def flow_smooth_l1_loss(flow_pred, flow_gt, mask):   # vx,vy,vz
+def flow_coarse_seed_loss(o_motion_06, flow_gt_06, valid_flow_seed_mask):
+    ...
+
+def flow_fine_readout_loss(flow_pred_heavy, flow_gt_heavy, valid_flow_mask):
     ...
 
 def flow_endpoint_error(flow_pred, flow_gt, mask):
@@ -485,13 +500,16 @@ def flow_endpoint_error(flow_pred, flow_gt, mask):
 mask 설계:
 
 ```text
-flow_loss_mask = occupied_gt & dynamic_gt & valid_gt
+valid_flow_seed_mask = confident coarse dynamic/occupied GT
+valid_flow_mask = confident occupied/dynamic GT on pred_heavy_mask
 ```
 
 검증:
 
 ```text
-flow loss는 dynamic/occupied mask에서만 계산한다.
+L_flow_coarse_seed는 0.6m dense seed에 적용한다.
+L_flow_fine_readout은 [N_heavy] final readout에만 적용한다.
+flow loss는 valid_flow_mask에서만 계산한다.
 mask가 전부 False여도 NaN이 나지 않는다.
 perfect flow prediction은 EPE가 0에 가깝다.
 vz 채널도 loss/EPE에 포함된다.
@@ -515,9 +533,10 @@ phases/phase_07_temporal_flow/scripts/train_flow_one_batch.py
 
 ```text
 1. moving cube toy sequence를 고정한다 (vz != 0 scene 포함).
-2. TemporalEnhancer + DynamicFlowHead를 붙인다.
-3. dynamic BCE와 flow SmoothL1을 같이 학습한다.
-4. 300 iteration 내에서 overfit되는지 확인한다.
+2. TemporalEnhancer + OccupancyFlowHead branch A를 붙인다.
+3. L_flow_coarse_seed와 dynamic BCE를 먼저 학습한다.
+4. toy pred_heavy_mask gather/readout skeleton의 shape를 확인한다.
+5. 300 iteration 내에서 overfit되는지 확인한다.
 ```
 
 출력 로그:
@@ -525,7 +544,8 @@ phases/phase_07_temporal_flow/scripts/train_flow_one_batch.py
 ```text
 iter
 loss_dynamic
-loss_flow
+loss_flow_coarse_seed
+loss_flow_fine_readout(toy readout)
 dynamic_acc
 flow_epe (vx,vy,vz)
 ```
@@ -533,7 +553,7 @@ flow_epe (vx,vy,vz)
 완료 기준:
 
 ```text
-moving cube의 flow 방향(vx,vy,vz)을 one-batch에서 맞춘다.
+moving cube의 O_motion_0.6 seed 방향(vx,vy,vz)을 one-batch에서 맞춘다.
 높이 방향 이동 cube에서 vz가 살아난다.
 dynamic mask가 cube 주변에서만 높아진다.
 ```
@@ -640,8 +660,8 @@ phases/phase_07_temporal_flow/notes.md
 2. memory queue max_history (과거3+현재1=4)
 3. ego-motion 3D warp convention
 4. temporal fusion 방식 (concat + 3D residual conv, attention 아님)
-5. per-voxel flow (vx,vy,vz) target coordinate convention
-6. flow loss mask
+5. O_motion_0.6 coarse seed와 [N_heavy] fine readout target coordinate convention
+6. valid_flow_mask와 dynamic mask
 7. final_occnet_v1로 가져갈 파일 목록
 ```
 
